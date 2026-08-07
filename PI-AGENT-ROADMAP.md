@@ -251,6 +251,8 @@ pi 自己的 [examples/extensions/](file:///Users/czh/Projects/pi-agent-czh/pi-m
 
 ## 模块 7：A2A 协议（P2）
 
+> ✅ **Phase 4 已完成**，详见 [docs/phases/phase-4-a2a.md](file:///Users/czh/Projects/pi-agent-czh/pi-main/docs/phases/phase-4-a2a.md)
+
 **目标**：让两个 pi 实例（或 pi 与任何 A2A agent）能互派任务、互传 artifact。
 
 ### 参考实现

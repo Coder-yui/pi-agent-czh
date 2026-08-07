@@ -1,0 +1,11 @@
+{
+  "name": "pi-a2a-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A2A (Agent2Agent) Protocol adapter for pi — enables pi to act as an A2A server (receiving tasks from other agents) and A2A client (delegating tasks to other A2A agents).",
+  "dependencies": {
+    "@a2a-js/sdk": "^1.0.1",
+    "express": "^4.21.0"
+  }
+}
