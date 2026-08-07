@@ -1,0 +1,13 @@
+{
+  "name": "pi-acp-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ACP (Agent Client Protocol) adapter for pi — bridges the official ACP stdio protocol to pi's built-in JSON-RPC mode, enabling Zed/OpenClaw/JetBrains and other ACP-compatible editors to drive pi as a coding agent.",
+  "bin": {
+    "pi-acp": "./dist/index.js"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.3.0"
+  }
+}
