@@ -8,4 +8,4 @@
 | Phase 2 | ACP 适配层 + Sandbox 执行 | [phase-2-acp-sandbox.md](./phase-2-acp-sandbox.md) |
 | Phase 3 | Planning & Reflection + Evals 框架 | [phase-3-plan-reflect-evals.md](./phase-3-plan-reflect-evals.md) |
 | Phase 4 | A2A 协议双向适配（Server + Client） | [phase-4-a2a.md](./phase-4-a2a.md) |
-| Phase 5 | (Future) | 待开始 |
+| Phase 5 | Agent Economy（Identity + Payments + Discovery）实验性 | [phase-5-agent-economy.md](./phase-5-agent-economy.md) |

@@ -17,7 +17,7 @@
 | Phase 3 | **Planning & Reflection** | P1 | `packages/coding-agent/examples/extensions/plan-reflect/` | ReAct/Reflexion 模式：计划注入 + 错误反思 + 重试熔断 |
 | Phase 3 | **Agentic Evaluation Framework** | P1 | `packages/evals/` | 基于 `vitest-evals`：dataset/solver/scorer 三段式，多模型对比，轨迹/成本记录 |
 | Phase 4 | **A2A 双向适配** | P2 | `packages/coding-agent/examples/extensions/a2a/` | Google Agent2Agent 协议：跨 agent 任务委派、artifact 传递 |
-| Phase 4 | **Agent Economy** | P2 | 待规划 | Identity/AP2/Discovery 生态层 |
+| Phase 5 | **Agent Economy** | P2 | `packages/coding-agent/examples/extensions/economy/` | DID:key 身份 + AP2 风格支付闭环 + Agent Discovery（实验性） |
 
 > 各阶段实施结果见 [`docs/phases/`](./docs/phases/) 目录。
 
@@ -246,6 +246,8 @@ pi 自己的 [examples/extensions/](file:///Users/czh/Projects/pi-agent-czh/pi-m
 | Phase 1 | MCP Client + Memory 系统 | [phase-1-mcp-memory.md](./docs/phases/phase-1-mcp-memory.md) |
 | Phase 2 | ACP 适配层 + Sandbox 执行 | [phase-2-acp-sandbox.md](./docs/phases/phase-2-acp-sandbox.md) |
 | Phase 3 | Planning & Reflection + Agentic Evals | [phase-3-plan-reflect-evals.md](./docs/phases/phase-3-plan-reflect-evals.md) |
+| Phase 4 | A2A 双向适配 | [phase-4-a2a.md](./docs/phases/phase-4-a2a.md) |
+| Phase 5 | Agent Economy（实验性） | [phase-5-agent-economy.md](./docs/phases/phase-5-agent-economy.md) |
 
 ---
 
@@ -285,6 +287,8 @@ pi 自己的 [examples/extensions/](file:///Users/czh/Projects/pi-agent-czh/pi-m
 ## 模块 8：Agent Economy 三件套（P2，前沿加分项）
 
 > ⚠️ **成熟度警告**：这部分协议都还在早期草案/社区阶段，不是像 MCP/A2A 那样稳定。简历里要如实写"跟踪/实验性接入"，面试官追问细节不会穿帮。
+>
+> ✅ **Phase 5 已完成（实验性 v0.1）**，详见 [docs/phases/phase-5-agent-economy.md](file:///Users/czh/Projects/pi-agent-czh/pi-main/docs/phases/phase-5-agent-economy.md)
 
 ### 8.1 Agent Identity — 身份认证与授权
 

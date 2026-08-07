@@ -1,0 +1,8 @@
+{
+  "name": "pi-agent-economy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental Agent Economy extension: DID:key Identity, AP2-style Payments, and Agent Discovery. Uses only Node.js built-in modules (no external dependencies).",
+  "dependencies": {}
+}
