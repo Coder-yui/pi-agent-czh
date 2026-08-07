@@ -1,0 +1,11 @@
+{
+  "name": "pi-extension-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.ts",
+  "description": "Long-term memory for pi via the official @modelcontextprotocol/server-memory Knowledge Graph server",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}
