@@ -6,6 +6,9 @@
   "main": "index.ts",
   "description": "Long-term memory for pi via the official @modelcontextprotocol/server-memory Knowledge Graph server",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/server-memory": "2026.7.4",
+    "typebox": "1.3.7"
   }
 }

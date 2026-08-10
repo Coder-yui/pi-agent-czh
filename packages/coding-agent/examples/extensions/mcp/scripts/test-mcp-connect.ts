@@ -8,7 +8,7 @@
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 async function main() {
 	const targetDir = process.argv[2] ?? process.cwd();
@@ -24,10 +24,7 @@ async function main() {
 		process.stderr.write(`[server stderr] ${chunk.toString()}`);
 	});
 
-	const client = new Client(
-		{ name: "pi-mcp-smoketest", version: "0.0.1" },
-		{ capabilities: {} },
-	);
+	const client = new Client({ name: "pi-mcp-smoketest", version: "0.0.1" }, { capabilities: {} });
 
 	console.log("[test] connecting...");
 	await client.connect(transport);

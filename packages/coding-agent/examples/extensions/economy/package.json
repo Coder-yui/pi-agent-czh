@@ -3,6 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Experimental Agent Economy extension: DID:key Identity, AP2-style Payments, and Agent Discovery. Uses only Node.js built-in modules (no external dependencies).",
-  "dependencies": {}
+  "description": "Experimental Agent Economy extension: DID:key Identity, AP2-style simulated payments, and A2A/MCP discovery.",
+  "dependencies": {
+    "@a2a-js/sdk": "1.0.1",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "jose": "6.2.8",
+    "multiformats": "14.0.5",
+    "proper-lockfile": "4.1.2",
+    "typebox": "1.3.7"
+  },
+  "devDependencies": {
+    "@types/proper-lockfile": "4.1.4"
+  }
 }

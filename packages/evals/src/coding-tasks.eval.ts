@@ -11,9 +11,9 @@
  * write a `sum` function and verify it with real execution.
  */
 
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
 import { expect } from "vitest";
 import { createJudge, describeEval, type JsonValue } from "vitest-evals";
 import { createPiCodingAgentHarness, type PiCodingAgentInput } from "./pi-harness.ts";
@@ -70,7 +70,10 @@ function createSumTaskHarness(name: string) {
 				try {
 					const raw = execFileSync(
 						process.execPath,
-						["-e", `const sum = require(${JSON.stringify(sumPath)}); console.log(JSON.stringify(sum(${tc.a},${tc.b})))`],
+						[
+							"-e",
+							`const sum = require(${JSON.stringify(sumPath)}); console.log(JSON.stringify(sum(${tc.a},${tc.b})))`,
+						],
 						{ encoding: "utf8", timeout: 5000 },
 					).trim();
 					const actual = JSON.parse(raw) as JsonValue;

@@ -9,7 +9,7 @@
 
 ## 模块 1：MCP Client
 
-**目标**：让 pi 能挂载任意 MCP 2026-07-28（无状态）Server，其 tools/resources/prompts 自动注册给 LLM。
+**目标**：让 pi 能通过官方 SDK 挂载 MCP Server，其 tools/resources/resource templates/prompts 自动注册给 LLM。
 
 **完成状态**：✅ 已完成，约 660 行 glue code。
 
@@ -17,7 +17,7 @@
 
 | 用途 | 仓库 / 包 |
 |---|---|
-| 官方 TS SDK（实际使用 `@modelcontextprotocol/sdk@^1.30.0`，v2 在开发中未发布） | [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) |
+| 官方 TS SDK（实际固定使用 `@modelcontextprotocol/sdk@1.30.0`） | [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) |
 | 多 server 管理参考 | VS Code Copilot MCP 接入逻辑（`@modelcontextprotocol/inspector` 可参考 UI 思路） |
 | 动态工具注册样例 | pi 自带 [dynamic-tools.ts](../../packages/coding-agent/examples/extensions/dynamic-tools.ts) |
 
@@ -29,11 +29,11 @@
 | **Stdio transport** | ✅ 通过 `StdioClientTransport` 启动子进程，支持 `env` 环境变量注入（如 GitHub token） |
 | **Streamable HTTP transport** | ✅ 通过 `StreamableHTTPClientTransport` 连接远程 MCP server，支持自定义 `headers`（如 Bearer token） |
 | **Tools 挂载** | ✅ 每个 MCP tool 以 `mcp__<server>__<tool>` 命名注册到 pi，JSON Schema → TypeBox 用 `Type.Unsafe` 透传 |
-| **Resources 挂载** | ✅ 合成一个 `mcp__<server>__read_resource` 工具，description 里列出所有可用 URI，LLM 可按需读取 |
+| **Resources 挂载** | ✅ 合成一个 `mcp__<server>__read_resource` 工具，description 里列出静态 resources 与 resource templates，LLM 可按需读取 |
 | **Prompts 挂载** | ✅ 每个 MCP prompt 注册为 `/mcp-prompt-<server>-<name>` 斜杠命令，支持位置参数和 `key=value` 参数，执行后作为用户消息注入 |
-| **list_changed 自动刷新** | ✅ 监听 `notifications/tools/list_changed`、`prompts/list_changed`、`resources/list_changed`，自动重列并重注册 |
+| **分页与 list_changed** | ✅ 沿 SDK 返回的 cursor 拉取 tools/prompts/resources/templates 全部分页；监听 tools/prompts/resources 的 list_changed 并刷新。消失的 tool 会从 pi active tools 移除，消失的 prompt 会变成明确的 unavailable 命令 |
 | **生命周期管理** | ✅ `session_start` 时连接所有 server，`session_shutdown` 时关闭所有 transport；状态栏显示连接状态（connecting/N servers/N tools/N prompts） |
-| **错误处理** | ✅ transport 级错误抛给 pi 标记工具失败；MCP tool 返回 `isError=true` 时将错误信息嵌入 content 文本 |
+| **取消与错误处理** | ✅ 工具/资源调用传递 AbortSignal 与超时；transport 错误抛给 pi，MCP tool 的 `isError=true` 保持为错误结果 |
 | **用户命令** | ✅ `/mcp-list`（列出所有 server/tool/prompt/resource）、`/mcp-reload`（重连所有 server） |
 | **E2E 测试** | ✅ 用 pi SDK 创建真实会话，加载扩展，挂载 `@modelcontextprotocol/server-filesystem`，验证工具注册 + `list_directory` 真实调用返回目录内容 |
 
@@ -100,17 +100,18 @@ cp packages/coding-agent/examples/extensions/mcp/mcp.example.json your-project/.
 
 | 能力 | 实现状态 |
 |---|---|
-| **后端进程管理** | ✅ `session_start` 时 spawn `npx -y @modelcontextprotocol/server-memory`，通过 `MEMORY_FILE_PATH` 环境变量指定持久化路径为 `<cwd>/.pi/memory.jsonl`；`session_shutdown` 时关闭 transport |
+| **后端进程管理** | ✅ `session_start` 时从已声明的 workspace 依赖解析并 spawn `@modelcontextprotocol/server-memory`，不在运行时联网下载；通过 `MEMORY_FILE_PATH` 指定持久化路径为 `<cwd>/.pi/memory.jsonl`，`session_shutdown` 时关闭 transport |
 | **记忆持久化** | ✅ 官方 server 负责 JSONL 存储（每行一个 entity/relation），每次写操作后立即 `fs.writeFile` 刷盘，实测 <500ms 落盘 |
 | **工具：memory__add_fact** | ✅ LLM 友好封装：自动判断 entity 是否存在，不存在先 `create_entities`，存在则 `add_observations`，LLM 无需关心底层 API 细节 |
 | **工具：memory__search** | ✅ 转发到官方 `search_nodes`（关键词匹配 entity 名称/类型/observations） |
 | **工具：memory__read_graph** | ✅ 转发到官方 `read_graph`，返回完整知识图谱 |
 | **工具：memory__create_relations** | ✅ 转发到官方 `create_relations`，支持 `User --uses--> Neovim` 这样的有向关系 |
 | **工具：memory__forget_entity** | ✅ 转发到官方 `delete_entities`，删除实体及其关联 relations |
-| **自动上下文注入** | ✅ `before_agent_start` 事件里读完整图谱，格式化为 markdown 注入 system prompt，LLM 每轮都能看到已知实体/关系 |
+| **状态一致性** | ✅ 所有 `memory__*` 工具声明为 sequential，避免支持并行工具调用的模型在同一轮让检索抢跑到写入之前 |
+| **自动上下文注入** | ✅ `before_agent_start` 用当前用户提示调用官方 `search_nodes`，只注入相关实体/关系，并设置实体数、observations 数和总字符上限，避免完整图谱随规模线性挤占上下文 |
 | **用户命令** | ✅ `/memory`（查看当前图谱）、`/memory-forget`（清空所有记忆，带 confirm 弹窗） |
 | **状态栏** | ✅ `session_start` 成功后显示 `Memory KG: <path>` |
-| **E2E 测试** | ✅ 创建 pi 会话 → spawn memory server → add 4 条 facts → read_graph 验证 → search 验证 → create_relations 验证 → JSONL 持久化验证 → forget_entity 验证 |
+| **E2E 测试** | ✅ 创建 pi 会话并写入事实/关系 → 完整关闭扩展与 server → 用同一 cwd 创建全新会话/server → 验证 JSONL 跨进程持久化与检索 → 删除实体 |
 
 ### 知识图谱数据模型（官方 server 定义）
 
@@ -146,7 +147,7 @@ Relation: { from: string, relationType: string, to: string }
   -e packages/coding-agent/examples/extensions/memory/index.ts
 ```
 
-LLM 会自动发现 `memory__*` 工具，每轮看到 `## Long-term Memory (Knowledge Graph)` 段，在学到持久事实时主动调用 `memory__add_fact`。
+LLM 会自动发现 `memory__*` 工具，并在相关检索有结果时看到有大小上限的 `## Relevant Long-term Memory` 段；完整图谱只通过显式工具或命令读取。
 
 ### 简历话术
 

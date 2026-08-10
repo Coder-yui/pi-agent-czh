@@ -10,15 +10,19 @@
  *  6. (macOS/Linux) SandboxManager initializes successfully and wraps a command
  */
 
-import { mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const { checkLethal } = await import(join(__dirname, "..", "index.ts"));
+const testRoot = join(tmpdir(), `pi-sandbox-test-${Date.now()}`);
+process.env.PI_CODING_AGENT_DIR = join(testRoot, "agent");
+mkdirSync(testRoot, { recursive: true });
+const { checkLethal, default: sandboxExtension } = await import(join(__dirname, "..", "index.ts"));
 
 let failures = 0;
 function assert(cond: boolean, name: string) {
@@ -81,32 +85,122 @@ assertBlocked("ls; pwd; echo done", false, "multi-segment safe chain allowed");
 console.log("\n[4] SandboxManager initialization (OS-level sandbox):\n");
 const platform = process.platform;
 if (platform === "darwin" || platform === "linux") {
+	const enforcementRoot = mkdtempSync(join(homedir(), ".pi-sandbox-test-"));
+	const secretPath = join(enforcementRoot, "sandbox-secret.txt");
+	const allowedWriteDir = join(enforcementRoot, "allowed-write");
+	const blockedWritePath = join(enforcementRoot, "blocked-write.txt");
+	const allowedWritePath = join(allowedWriteDir, "allowed.txt");
+	mkdirSync(allowedWriteDir, { recursive: true });
+	writeFileSync(secretPath, "sandbox-secret-value");
 	try {
 		await SandboxManager.initialize({
 			network: { allowedDomains: ["example.com"], deniedDomains: [] },
-			filesystem: { denyRead: ["~/.ssh"], allowWrite: ["/tmp"], denyWrite: [] },
+			filesystem: { denyRead: [secretPath], allowWrite: [allowedWriteDir], denyWrite: [] },
 		});
 		console.log("  ✅ SandboxManager.initialize succeeded");
 
 		const wrapped = await SandboxManager.wrapWithSandbox("echo hello");
 		assert(typeof wrapped === "string" && wrapped.length > 0, "wrapWithSandbox returned a wrapped command");
 
+		const deniedRead = spawnSync(
+			"bash",
+			["-c", await SandboxManager.wrapWithSandbox(`cat ${JSON.stringify(secretPath)}`)],
+			{
+				cwd: testRoot,
+				encoding: "utf8",
+			},
+		);
+		assert(
+			deniedRead.status !== 0 && !deniedRead.stdout.includes("sandbox-secret-value"),
+			"OS sandbox denies a configured secret read",
+		);
+		const deniedWrite = spawnSync(
+			"bash",
+			["-c", await SandboxManager.wrapWithSandbox(`printf blocked > ${JSON.stringify(blockedWritePath)}`)],
+			{ cwd: testRoot, encoding: "utf8" },
+		);
+		assert(deniedWrite.status !== 0 && !existsSync(blockedWritePath), "OS sandbox denies writes outside allowWrite");
+		const allowedWrite = spawnSync(
+			"bash",
+			["-c", await SandboxManager.wrapWithSandbox(`printf allowed > ${JSON.stringify(allowedWritePath)}`)],
+			{ cwd: testRoot, encoding: "utf8" },
+		);
+		assert(
+			allowedWrite.status === 0 && readFileSync(allowedWritePath, "utf8") === "allowed",
+			"OS sandbox permits writes inside allowWrite",
+		);
+
 		await SandboxManager.reset();
 		console.log("  ✅ SandboxManager.reset succeeded");
-	} catch (err) {
-		console.log(`  ⚠️  SandboxManager init failed (may need native deps): ${err instanceof Error ? err.message : err}`);
-		console.log("     (This is non-fatal — the lethal filter + audit still work.)");
+	} catch (error: unknown) {
+		assert(false, `OS sandbox enforcement test failed: ${error instanceof Error ? error.message : error}`);
+		try {
+			await SandboxManager.reset();
+		} catch {
+			/* ignore cleanup errors */
+		}
 	}
+	rmSync(enforcementRoot, { recursive: true, force: true });
 } else {
 	console.log(`  ⚠️  Skipping OS sandbox test on ${platform} (only darwin/linux supported)`);
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n[5] TypeScript syntax check (via dynamic import):\n");
+console.log("\n[5] Real extension user_bash interception:\n");
+const hooks = new Map<string, unknown[]>();
+const extensionApi = {
+	registerFlag() {},
+	getFlag() {
+		return true;
+	},
+	registerTool() {},
+	registerCommand() {},
+	on(event: string, handler: unknown) {
+		const list = hooks.get(event) ?? [];
+		list.push(handler);
+		hooks.set(event, list);
+	},
+};
+sandboxExtension(extensionApi);
+const context = {
+	cwd: testRoot,
+	ui: {
+		notify() {},
+		setStatus() {},
+		theme: {
+			fg(_color: string, text: string) {
+				return text;
+			},
+		},
+	},
+};
+const sessionStart = hooks.get("session_start")?.[0] as (event: unknown, ctx: unknown) => Promise<void>;
+const userBash = hooks.get("user_bash")?.[0] as (event: { command: string; cwd: string }) =>
+	| Promise<{
+			result?: { exitCode?: number };
+			operations?: unknown;
+	  }>
+	| { result?: { exitCode?: number }; operations?: unknown };
+await sessionStart({ type: "session_start", reason: "startup" }, context);
+const blockedDirect = await userBash({ command: "rm -rf /", cwd: testRoot });
+assert(blockedDirect.result?.exitCode === 126, "direct !bash lethal command is blocked before execution");
+const safeDirect = await userBash({ command: "echo safe", cwd: testRoot });
+assert(safeDirect.operations !== undefined, "direct !bash safe command receives an audited execution backend");
+const auditPath = join(process.env.PI_CODING_AGENT_DIR, "sandbox-audit.jsonl");
+assert(
+	existsSync(auditPath) && readFileSync(auditPath, "utf8").includes("rm -rf /"),
+	"direct !bash block is written to the audit log",
+);
+
+// ---------------------------------------------------------------------------
+console.log("\n[6] TypeScript syntax check (via dynamic import):\n");
 // If we got here, index.ts loaded and checkLethal is callable — that means
 // tsx successfully parsed and compiled the file.
 assert(typeof checkLethal === "function", "sandbox/index.ts loads without syntax errors");
 
 // ---------------------------------------------------------------------------
-console.log(`\n${failures === 0 ? "[passed] ✅ All sandbox tests passed" : `[failed] ❌ ${failures} test(s) failed`}\n`);
+console.log(
+	`\n${failures === 0 ? "[passed] ✅ All sandbox tests passed" : `[failed] ❌ ${failures} test(s) failed`}\n`,
+);
 if (failures > 0) process.exit(1);
+rmSync(testRoot, { recursive: true, force: true });

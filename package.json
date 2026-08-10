@@ -8,7 +8,14 @@
 		"packages/coding-agent/examples/extensions/with-deps",
 		"packages/coding-agent/examples/extensions/custom-provider-anthropic",
 		"packages/coding-agent/examples/extensions/custom-provider-gitlab-duo",
+		"packages/coding-agent/examples/extensions/mcp",
+		"packages/coding-agent/examples/extensions/memory",
+		"packages/coding-agent/examples/extensions/acp",
+		"packages/coding-agent/examples/extensions/agent-loop",
+		"packages/coding-agent/examples/extensions/agent-graph",
 		"packages/coding-agent/examples/extensions/sandbox",
+		"packages/coding-agent/examples/extensions/a2a",
+		"packages/coding-agent/examples/extensions/economy",
 		"packages/coding-agent/examples/extensions/gondolin"
 	],
 	"scripts": {

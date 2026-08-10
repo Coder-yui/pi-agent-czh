@@ -1,0 +1,38 @@
+{
+	"version": 1,
+	"name": "implement-review",
+	"description": "Implement a task, review it, and loop back when the review requests changes.",
+	"entrypoint": "implement",
+	"maxSteps": 12,
+	"nodes": [
+		{
+			"id": "implement",
+			"type": "agent",
+			"task": "Implement this task and run focused checks: {{input}}. Previous review: {{outputs.review}}",
+			"maxVisits": 3,
+			"timeoutMs": 600000
+		},
+		{
+			"id": "review",
+			"type": "agent",
+			"task": "Review the implementation for: {{input}}. Inspect the workspace and end with either APPROVED or CHANGES_REQUIRED followed by concrete findings.",
+			"tools": ["read", "grep", "find", "ls", "bash"],
+			"maxVisits": 3,
+			"timeoutMs": 600000
+		},
+		{
+			"id": "approval",
+			"type": "approval",
+			"title": "Accept Agent Graph result?",
+			"message": "Review output:\n\n{{outputs.review}}\n\nAccept this implementation?"
+		}
+	],
+	"edges": [
+		{ "from": "implement", "to": "review", "when": "success" },
+		{ "from": "implement", "to": "__end__", "when": "always" },
+		{ "from": "review", "to": "implement", "when": "output_contains", "contains": "CHANGES_REQUIRED" },
+		{ "from": "review", "to": "approval", "when": "output_contains", "contains": "APPROVED" },
+		{ "from": "review", "to": "__end__", "when": "always" },
+		{ "from": "approval", "to": "__end__", "when": "always" }
+	]
+}

@@ -81,6 +81,7 @@ import {
 	type ReplacedSessionContext,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
+	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type ToolDefinition,
@@ -830,6 +831,11 @@ export class AgentSession {
 			this._unsubscribeAgent();
 			this._unsubscribeAgent = undefined;
 		}
+	}
+
+	/** Notify loaded extensions that this session is shutting down. */
+	async shutdownExtensions(reason: SessionShutdownEvent["reason"] = "quit"): Promise<boolean> {
+		return emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason });
 	}
 
 	/**
