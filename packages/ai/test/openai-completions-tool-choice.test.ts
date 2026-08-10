@@ -1407,6 +1407,10 @@ describe("openai-completions tool_choice", () => {
 
 		for (const model of cases) {
 			let payload: unknown;
+			expect(model.api).toBe("openai-completions");
+			if (model.api !== "openai-completions") {
+				throw new Error(`Expected ${model.provider}/${model.id} to use the OpenAI completions API`);
+			}
 			expect(model.compat?.maxTokensField).toBe("max_tokens");
 
 			await streamSimple(
