@@ -1402,10 +1402,15 @@ describe("openai-completions tool_choice", () => {
 		expect(params.reasoning_effort).toBeUndefined();
 	});
 
-	it("sends max_tokens for OpenCode completions models", async () => {
+	it("sends max_tokens for OpenCode models that use completions", async () => {
 		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "grok-build-0.1")!] as const;
+		let tested = 0;
 
 		for (const model of cases) {
+			if (model.api !== "openai-completions") {
+				continue;
+			}
+			tested += 1;
 			let payload: unknown;
 			expect(model.compat?.maxTokensField).toBe("max_tokens");
 
@@ -1427,6 +1432,8 @@ describe("openai-completions tool_choice", () => {
 			expect(params.max_tokens).toBe(123);
 			expect(params.max_completion_tokens).toBeUndefined();
 		}
+
+		expect(tested).toBeGreaterThan(0);
 	});
 
 	it("sends max_tokens for Z.AI completions models", async () => {

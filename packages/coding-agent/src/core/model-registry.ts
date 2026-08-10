@@ -1,6 +1,7 @@
 import type {
 	Api,
 	AssistantMessage,
+	AssistantMessageEventStream,
 	AuthResult,
 	Context,
 	Model,
@@ -106,6 +107,14 @@ export class ModelRegistry {
 		options?: ModelsApiStreamOptions<TApi>,
 	): Promise<AssistantMessage> {
 		return this.runtime.complete(model, context, options);
+	}
+
+	stream<TApi extends Api>(
+		model: Model<TApi>,
+		context: Context,
+		options?: ModelsApiStreamOptions<TApi>,
+	): AssistantMessageEventStream {
+		return this.runtime.stream(model, context, options);
 	}
 
 	getProviderDisplayName(provider: string): string {

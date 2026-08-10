@@ -32,16 +32,25 @@
  * ```
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Prompt, Resource, Tool } from "@modelcontextprotocol/sdk/types.js";
-import { Type, type TSchema } from "typebox";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+	type Prompt,
+	PromptListChangedNotificationSchema,
+	type Resource,
+	ResourceListChangedNotificationSchema,
+	type ResourceTemplate,
+	type Tool,
+	ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { type TSchema, Type } from "typebox";
 
 // ============================================================================
 // Config loading
@@ -90,9 +99,9 @@ function loadConfig(cwd: string): McpConfig {
 					mcpServers: { ...merged.mcpServers, ...raw.mcpServers },
 				};
 			}
-		} catch (err: any) {
+		} catch (error: unknown) {
 			// eslint-disable-next-line no-console
-			console.warn(`[mcp] failed to load ${path}: ${err.message}`);
+			console.warn(`[mcp] failed to load ${path}: ${errorMessage(error)}`);
 		}
 	}
 
@@ -129,7 +138,10 @@ function convertContent(blocks: McpContentBlock[]): (TextContent | ImageContent)
 				out.push({ type: "image", data: block.data, mimeType: block.mimeType });
 				break;
 			case "audio":
-				out.push({ type: "text", text: `[audio content, mime=${block.mimeType}, ${block.data.length} chars base64]` });
+				out.push({
+					type: "text",
+					text: `[audio content, mime=${block.mimeType}, ${block.data.length} chars base64]`,
+				});
 				break;
 			case "resource":
 				if (block.resource.text !== undefined) {
@@ -187,11 +199,72 @@ interface ConnectedServer {
 	tools: Tool[];
 	prompts: Prompt[];
 	resources: Resource[];
+	resourceTemplates: ResourceTemplate[];
 	registeredToolNames: Set<string>;
 	registeredCommandNames: Set<string>;
 }
 
-async function connectStdioServer(name: string, cfg: StdioServerConfig): Promise<{ transport: ServerTransport; close: () => Promise<void> }> {
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+async function listAllTools(client: Client): Promise<Tool[]> {
+	const tools: Tool[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: 15_000 });
+		tools.push(...page.tools);
+		cursor = page.nextCursor;
+	} while (cursor);
+	return tools;
+}
+
+async function listAllPrompts(client: Client): Promise<Prompt[]> {
+	const prompts: Prompt[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await client.listPrompts(cursor ? { cursor } : undefined, { timeout: 15_000 });
+		prompts.push(...page.prompts);
+		cursor = page.nextCursor;
+	} while (cursor);
+	return prompts;
+}
+
+async function listAllResources(client: Client): Promise<Resource[]> {
+	const resources: Resource[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await client.listResources(cursor ? { cursor } : undefined, { timeout: 15_000 });
+		resources.push(...page.resources);
+		cursor = page.nextCursor;
+	} while (cursor);
+	return resources;
+}
+
+async function listAllResourceTemplates(client: Client): Promise<ResourceTemplate[]> {
+	const templates: ResourceTemplate[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await client.listResourceTemplates(cursor ? { cursor } : undefined, { timeout: 15_000 });
+		templates.push(...page.resourceTemplates);
+		cursor = page.nextCursor;
+	} while (cursor);
+	return templates;
+}
+
+function syncActiveTools(pi: ExtensionAPI, previous: ReadonlySet<string>, current: ReadonlySet<string>): void {
+	const activeTools = new Set(pi.getActiveTools());
+	for (const toolName of previous) {
+		if (!current.has(toolName)) activeTools.delete(toolName);
+	}
+	for (const toolName of current) activeTools.add(toolName);
+	pi.setActiveTools([...activeTools]);
+}
+
+async function connectStdioServer(
+	name: string,
+	cfg: StdioServerConfig,
+): Promise<{ transport: ServerTransport; close: () => Promise<void> }> {
 	const env: Record<string, string> = {
 		...getDefaultEnvironment(),
 		...(cfg.env ?? {}),
@@ -217,7 +290,6 @@ async function connectStdioServer(name: string, cfg: StdioServerConfig): Promise
 }
 
 async function connectHttpServer(
-	name: string,
 	cfg: HttpServerConfig,
 ): Promise<{ transport: ServerTransport; close: () => Promise<void> }> {
 	const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
@@ -228,11 +300,8 @@ async function connectHttpServer(
 }
 
 function registerServerTools(pi: ExtensionAPI, server: ConnectedServer) {
-	// Clean out previously-registered tools from a prior listChanged refresh.
-	for (const existing of server.registeredToolNames) {
-		// There's no public unregisterTool(); pi keeps the latest definition if
-		// we re-register with the same name, which is good enough for refresh.
-	}
+	// There's no public unregisterTool(); re-registering replaces definitions
+	// with the same names after a listChanged notification.
 	server.registeredToolNames.clear();
 
 	for (const tool of server.tools) {
@@ -249,12 +318,16 @@ function registerServerTools(pi: ExtensionAPI, server: ConnectedServer) {
 				? `${tool.name} (from ${server.name} MCP server): ${tool.description.slice(0, 200)}`
 				: undefined,
 			parameters,
-			async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 				try {
-					const result = await server.client.callTool({
-						name: tool.name,
-						arguments: params as Record<string, unknown>,
-					});
+					const result = await server.client.callTool(
+						{
+							name: tool.name,
+							arguments: params as Record<string, unknown>,
+						},
+						undefined,
+						{ signal, timeout: 60_000, maxTotalTimeout: 120_000, resetTimeoutOnProgress: true },
+					);
 
 					const blocks = (result.content as McpContentBlock[] | undefined) ?? [];
 					const mcpIsError = !!result.isError;
@@ -280,8 +353,8 @@ function registerServerTools(pi: ExtensionAPI, server: ConnectedServer) {
 							structuredContent: result.structuredContent,
 						},
 					};
-				} catch (err: any) {
-					throw new Error(`[mcp:${server.name}/${tool.name}] ${err?.message ?? String(err)}`);
+				} catch (error: unknown) {
+					throw new Error(`[mcp:${server.name}/${tool.name}] ${errorMessage(error)}`, { cause: error });
 				}
 			},
 		});
@@ -296,33 +369,39 @@ function registerResourceAccessTool(pi: ExtensionAPI, server: ConnectedServer) {
 		server.resources.length > 0
 			? server.resources.map((r) => `- ${r.uri}  ${r.description ?? r.name ?? ""}`).join("\n")
 			: "(server did not advertise any resources)";
+	const templateList =
+		server.resourceTemplates.length > 0
+			? server.resourceTemplates
+					.map((template) => `- ${template.uriTemplate}  ${template.description ?? template.name}`)
+					.join("\n")
+			: "(server did not advertise any resource templates)";
 
 	pi.registerTool({
 		name: toolName,
 		label: `mcp:${server.name}/read_resource`,
-		description: `Read a resource from MCP server "${server.name}" by URI.\n\nAvailable resources:\n${resourceList}`,
+		description: `Read a resource from MCP server "${server.name}" by URI. URI templates are accepted after substituting their variables.\n\nAvailable resources:\n${resourceList}\n\nResource templates:\n${templateList}`,
 		promptSnippet: `Read resource from ${server.name} MCP server by URI`,
 		parameters: Type.Object({
 			uri: Type.String({ description: "Resource URI to read" }),
 		}),
-		async execute(_callId, params) {
+		async execute(_callId, params, signal) {
 			try {
-				const result = await server.client.readResource({ uri: String(params.uri) });
-				const blocks: McpContentBlock[] = (result.contents as any[]).map((c) => {
-					if (c.text !== undefined) {
+				const result = await server.client.readResource(
+					{ uri: String(params.uri) },
+					{ signal, timeout: 30_000, maxTotalTimeout: 60_000 },
+				);
+				const blocks: McpContentBlock[] = result.contents.map((c) => {
+					if ("text" in c) {
 						return { type: "resource", resource: { uri: c.uri, text: c.text, mimeType: c.mimeType } };
 					}
-					if (c.blob !== undefined) {
-						return { type: "resource", resource: { uri: c.uri, blob: c.blob, mimeType: c.mimeType } };
-					}
-					return { type: "text", text: `[empty resource ${c.uri}]` };
+					return { type: "resource", resource: { uri: c.uri, blob: c.blob, mimeType: c.mimeType } };
 				});
 				return {
 					content: convertContent(blocks),
 					details: { server: server.name, tool: "read_resource" },
 				};
-			} catch (err: any) {
-				throw new Error(`[mcp:${server.name}/read_resource] ${err?.message ?? String(err)}`);
+			} catch (error: unknown) {
+				throw new Error(`[mcp:${server.name}/read_resource] ${errorMessage(error)}`, { cause: error });
 			}
 		},
 	});
@@ -330,12 +409,13 @@ function registerResourceAccessTool(pi: ExtensionAPI, server: ConnectedServer) {
 }
 
 function registerPromptCommands(pi: ExtensionAPI, server: ConnectedServer) {
-	// Clean up previous commands (best-effort: re-registering overwrites).
+	const previousCommandNames = new Set(server.registeredCommandNames);
 	server.registeredCommandNames.clear();
 
 	for (const prompt of server.prompts) {
 		const cmd = makeCommandName(server.name, prompt.name);
 		server.registeredCommandNames.add(cmd);
+		previousCommandNames.delete(cmd);
 		const argNames: string[] = (prompt.arguments ?? []).map((a) => a.name);
 
 		pi.registerCommand(cmd, {
@@ -375,22 +455,26 @@ function registerPromptCommands(pi: ExtensionAPI, server: ConnectedServer) {
 
 					// Inject the assembled prompt as a user message so the agent responds to it.
 					ctx.ui.notify(lines.join("\n"), "info");
-					await ctx.sendMessage({
-						role: "user",
-						content: [{ type: "text", text: lines.join("\n\n") }],
-					});
-				} catch (err: any) {
-					ctx.ui.notify(`[mcp] failed to get prompt "${prompt.name}": ${err?.message ?? String(err)}`, "error");
+					pi.sendUserMessage(lines.join("\n\n"));
+				} catch (error: unknown) {
+					ctx.ui.notify(`[mcp] failed to get prompt "${prompt.name}": ${errorMessage(error)}`, "error");
 				}
+			},
+		});
+	}
+
+	for (const commandName of previousCommandNames) {
+		pi.registerCommand(commandName, {
+			description: `[MCP:${server.name}] prompt removed by the server`,
+			handler: async (_args, ctx) => {
+				ctx.ui.notify(`MCP prompt /${commandName} is no longer advertised by ${server.name}.`, "warning");
 			},
 		});
 	}
 }
 
 async function connectServer(name: string, cfg: ServerConfig): Promise<ConnectedServer> {
-	const { transport } = isHttpConfig(cfg)
-		? await connectHttpServer(name, cfg)
-		: await connectStdioServer(name, cfg);
+	const { transport } = isHttpConfig(cfg) ? await connectHttpServer(cfg) : await connectStdioServer(name, cfg);
 
 	const client = new Client(
 		{ name: "pi-mcp-extension", version: "0.0.1" },
@@ -404,25 +488,28 @@ async function connectServer(name: string, cfg: ServerConfig): Promise<Connected
 	let tools: Tool[] = [];
 	let prompts: Prompt[] = [];
 	let resources: Resource[] = [];
+	let resourceTemplates: ResourceTemplate[] = [];
 
 	const caps = client.getServerCapabilities() ?? {};
 
 	if (caps.tools) {
-		const toolsResult = await client.listTools();
-		tools = toolsResult.tools ?? [];
+		tools = await listAllTools(client);
 	}
 	if (caps.prompts) {
 		try {
-			const promptsResult = await client.listPrompts();
-			prompts = promptsResult.prompts ?? [];
+			prompts = await listAllPrompts(client);
 		} catch {
 			/* prompts not supported */
 		}
 	}
 	if (caps.resources) {
 		try {
-			const resourcesResult = await client.listResources();
-			resources = resourcesResult.resources ?? [];
+			resources = await listAllResources(client);
+			try {
+				resourceTemplates = await listAllResourceTemplates(client);
+			} catch {
+				resourceTemplates = [];
+			}
 		} catch {
 			/* resources not supported */
 		}
@@ -435,6 +522,7 @@ async function connectServer(name: string, cfg: ServerConfig): Promise<Connected
 		tools,
 		prompts,
 		resources,
+		resourceTemplates,
 		registeredToolNames: new Set(),
 		registeredCommandNames: new Set(),
 	};
@@ -453,21 +541,18 @@ function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer) {
 	// The SDK Client exposes `setNotificationHandler` via Protocol base class.
 	const refreshTools = async () => {
 		try {
-			const r = await server.client.listTools();
-			server.tools = r.tools ?? [];
-			registerServerTools(pi, server);
-			registerResourceAccessTool(pi, server);
+			server.tools = await listAllTools(server.client);
+			registerServerAll(pi, server);
 			// eslint-disable-next-line no-console
 			console.warn(`[mcp:${server.name}] tools refreshed: ${server.tools.length}`);
-		} catch (err: any) {
+		} catch (error: unknown) {
 			// eslint-disable-next-line no-console
-			console.warn(`[mcp:${server.name}] failed to refresh tools: ${err?.message ?? err}`);
+			console.warn(`[mcp:${server.name}] failed to refresh tools: ${errorMessage(error)}`);
 		}
 	};
 	const refreshPrompts = async () => {
 		try {
-			const r = await server.client.listPrompts();
-			server.prompts = r.prompts ?? [];
+			server.prompts = await listAllPrompts(server.client);
 			registerPromptCommands(pi, server);
 		} catch {
 			/* ignore */
@@ -475,31 +560,31 @@ function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer) {
 	};
 	const refreshResources = async () => {
 		try {
-			const r = await server.client.listResources();
-			server.resources = r.resources ?? [];
-			registerResourceAccessTool(pi, server);
+			server.resources = await listAllResources(server.client);
+			try {
+				server.resourceTemplates = await listAllResourceTemplates(server.client);
+			} catch {
+				server.resourceTemplates = [];
+			}
+			registerServerAll(pi, server);
 		} catch {
 			/* ignore */
 		}
 	};
 
 	try {
-		// Methods on Protocol base (imported from SDK). We use dynamic method names
-		// to stay tolerant of SDK version drift.
-		const proto = Object.getPrototypeOf(server.client);
-		const setNotif = proto.setNotificationHandler?.bind(server.client);
-		if (setNotif && caps.tools?.listChanged) {
-			setNotif({ method: "notifications/tools/list_changed" }, async () => {
+		if (caps.tools?.listChanged) {
+			server.client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
 				await refreshTools();
 			});
 		}
-		if (setNotif && caps.prompts?.listChanged) {
-			setNotif({ method: "notifications/prompts/list_changed" }, async () => {
+		if (caps.prompts?.listChanged) {
+			server.client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
 				await refreshPrompts();
 			});
 		}
-		if (setNotif && caps.resources?.listChanged) {
-			setNotif({ method: "notifications/resources/list_changed" }, async () => {
+		if (caps.resources?.listChanged) {
+			server.client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
 				await refreshResources();
 			});
 		}
@@ -509,9 +594,11 @@ function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer) {
 }
 
 function registerServerAll(pi: ExtensionAPI, server: ConnectedServer) {
+	const previousToolNames = new Set(server.registeredToolNames);
 	registerServerTools(pi, server);
 	registerResourceAccessTool(pi, server);
 	registerPromptCommands(pi, server);
+	syncActiveTools(pi, previousToolNames, server.registeredToolNames);
 }
 
 // ============================================================================
@@ -523,6 +610,7 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 
 	async function shutdownAll() {
 		for (const server of servers) {
+			syncActiveTools(pi, server.registeredToolNames, new Set());
 			try {
 				if (typeof server.transport.close === "function") {
 					await server.transport.close();
@@ -566,9 +654,9 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 				connected += 1;
 				totalTools += server.tools.length;
 				totalPrompts += server.prompts.length;
-			} catch (err: any) {
+			} catch (error: unknown) {
 				failed += 1;
-				ctx.ui.notify(`[mcp] failed to connect "${name}": ${err?.message ?? String(err)}`, "error");
+				ctx.ui.notify(`[mcp] failed to connect "${name}": ${errorMessage(error)}`, "error");
 			}
 		}
 
@@ -602,7 +690,9 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 				if (s.tools.length) {
 					lines.push(`    tools (${s.tools.length}):`);
 					for (const t of s.tools) {
-						lines.push(`      - ${makeToolName(s.name, t.name)}  ${t.description ? `— ${(t.description ?? "").slice(0, 120)}` : ""}`);
+						lines.push(
+							`      - ${makeToolName(s.name, t.name)}  ${t.description ? `— ${(t.description ?? "").slice(0, 120)}` : ""}`,
+						);
 					}
 				}
 				if (s.prompts.length) {
@@ -617,6 +707,14 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 					lines.push(`    resources (${s.resources.length}):`);
 					for (const r of s.resources) {
 						lines.push(`      - ${r.uri}  ${r.description ? `— ${(r.description ?? "").slice(0, 100)}` : ""}`);
+					}
+				}
+				if (s.resourceTemplates.length) {
+					lines.push(`    resource templates (${s.resourceTemplates.length}):`);
+					for (const template of s.resourceTemplates) {
+						lines.push(
+							`      - ${template.uriTemplate}  ${template.description ? `— ${template.description.slice(0, 100)}` : ""}`,
+						);
 					}
 				}
 			}
@@ -644,12 +742,15 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 					connected += 1;
 					totalTools += server.tools.length;
 					totalPrompts += server.prompts.length;
-				} catch (err: any) {
-					ctx.ui.notify(`[mcp] failed to connect "${name}": ${err?.message ?? String(err)}`, "error");
+				} catch (error: unknown) {
+					ctx.ui.notify(`[mcp] failed to connect "${name}": ${errorMessage(error)}`, "error");
 				}
 			}
 
-			ctx.ui.notify(`MCP reloaded: ${connected} server(s), ${totalTools} tool(s), ${totalPrompts} prompt(s)`, "info");
+			ctx.ui.notify(
+				`MCP reloaded: ${connected} server(s), ${totalTools} tool(s), ${totalPrompts} prompt(s)`,
+				"info",
+			);
 			ctx.ui.setStatus("mcp", `MCP: ${connected} server(s), ${totalTools} tool(s), ${totalPrompts} prompt(s)`);
 		},
 	});

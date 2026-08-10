@@ -9,7 +9,8 @@
  * Does NOT call the LLM — we only exercise the extension + tool wiring.
  */
 
-import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +18,7 @@ import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 
 // Locate coding-agent package root from this script's location.
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 const CODING_AGENT_ROOT = join(__dirname, "../../../../");
 const CORE_DIR = join(CODING_AGENT_ROOT, "src", "core");
 
@@ -25,6 +27,11 @@ const { createAgentSession } = await import(join(CORE_DIR, "sdk.ts"));
 const { SessionManager } = await import(join(CORE_DIR, "session-manager.ts"));
 const { SettingsManager } = await import(join(CORE_DIR, "settings-manager.ts"));
 const mcpExtension = (await import(join(__dirname, "..", "index.ts"))).default;
+const filesystemServer = join(
+	dirname(require.resolve("@modelcontextprotocol/server-filesystem/package.json")),
+	"dist",
+	"index.js",
+);
 
 async function main() {
 	const tempDir = join(tmpdir(), `pi-mcp-e2e-${Date.now()}`);
@@ -40,8 +47,8 @@ async function main() {
 			{
 				mcpServers: {
 					filesystem: {
-						command: "npx",
-						args: ["-y", "@modelcontextprotocol/server-filesystem", cwd],
+						command: process.execPath,
+						args: [filesystemServer, cwd],
 					},
 				},
 			},
@@ -69,7 +76,7 @@ async function main() {
 	console.log(`[test] cwd = ${cwd}`);
 	console.log(
 		`[test] discovered extensions:`,
-		resourceLoader.getExtensions().extensions.map((e) => e.sourceInfo.path),
+		resourceLoader.getExtensions().extensions.map((e: { sourceInfo: { path: string } }) => e.sourceInfo.path),
 	);
 
 	const { session } = await createAgentSession({
@@ -90,7 +97,7 @@ async function main() {
 	const allTools = session.agent.state.tools;
 	console.log(`[test] tools after bindExtensions: ${allTools.length}`);
 
-	const mcpTools = allTools.filter((t) => t.name.startsWith("mcp__"));
+	const mcpTools = allTools.filter((t: { name: string }) => t.name.startsWith("mcp__"));
 	console.log(`[test] MCP tools registered: ${mcpTools.length}`);
 	for (const t of mcpTools) {
 		console.log(`    - ${t.name}  (label=${t.label ?? "(no label)"})`);
@@ -101,7 +108,7 @@ async function main() {
 	}
 
 	// Pick the list_directory tool and actually invoke it.
-	const listDir = mcpTools.find((t) => t.name === "mcp__filesystem__list_directory");
+	const listDir = mcpTools.find((t: { name: string }) => t.name === "mcp__filesystem__list_directory");
 	if (!listDir) throw new Error("mcp__filesystem__list_directory not found");
 
 	console.log(`[test] invoking ${listDir.name} with path=${cwd}`);
@@ -116,8 +123,8 @@ async function main() {
 	}
 
 	const textContent = result.content
-		.filter((b): b is { type: "text"; text: string } => b.type === "text")
-		.map((b) => b.text)
+		.filter((b: { type: string; text?: string }): b is { type: "text"; text: string } => b.type === "text")
+		.map((b: { text: string }) => b.text)
 		.join("\n");
 	if (!textContent.includes("hello.txt")) {
 		throw new Error(`Expected hello.txt in list_directory output, got:\n${textContent}`);
@@ -126,6 +133,7 @@ async function main() {
 		throw new Error(`Tool reported MCP isError: ${JSON.stringify(result.details)}`);
 	}
 
+	await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 	session.dispose();
 
 	// Cleanup temp dir

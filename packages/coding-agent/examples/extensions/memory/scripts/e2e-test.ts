@@ -70,7 +70,7 @@ async function main() {
 	await session.bindExtensions({});
 
 	const allTools = session.agent.state.tools;
-	const memTools = allTools.filter((t) => t.name.startsWith("memory__"));
+	const memTools = allTools.filter((t: { name: string }) => t.name.startsWith("memory__"));
 	console.log(`[test] memory tools registered: ${memTools.length}`);
 	for (const t of memTools) {
 		console.log(`    - ${t.name}  (${t.label ?? "(no label)"})`);
@@ -81,7 +81,7 @@ async function main() {
 	}
 
 	const getTool = (name: string) => {
-		const t = memTools.find((x) => x.name === name);
+		const t = memTools.find((x: { name: string }) => x.name === name);
 		if (!t) throw new Error(`tool ${name} not found`);
 		return t;
 	};
@@ -117,7 +117,9 @@ async function main() {
 	console.log(`[test] memory__search("testing framework"): ${searchText.slice(0, 300)}`);
 	// The KG server's search should surface the Project/Vitest observation.
 	if (!/vitest/i.test(searchText)) {
-		console.log(`[warn] search did not surface Vitest by substring — server-side search may be index-only. Continuing.`);
+		console.log(
+			`[warn] search did not surface Vitest by substring — server-side search may be index-only. Continuing.`,
+		);
 	}
 
 	// 4. Create a relation
@@ -142,7 +144,10 @@ async function main() {
 		throw new Error(`memory.jsonl not found or empty at ${memoryFile}`);
 	}
 	// Parse JSONL: one JSON object per line (entities + relations interleaved).
-	const lines = persistedRaw.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+	const lines = persistedRaw
+		.split("\n")
+		.filter(Boolean)
+		.map((l) => JSON.parse(l));
 	const entities = lines.filter((l: any) => l.type === "entity");
 	const relations = lines.filter((l: any) => l.type === "relation");
 	console.log(`[test] persisted entities: ${entities.length}, relations: ${relations.length}`);
@@ -157,17 +162,55 @@ async function main() {
 		throw new Error("works_on relation not persisted");
 	}
 
-	// 6. Forget an entity
-	const forgetRes = await getTool("memory__forget_entity").execute("call", { name: "Project" });
+	// 6. Stop the first process, create a new session, and verify persistence through the real server API.
+	await session.shutdownExtensions("quit");
+	session.dispose();
+	const restartSettingsManager = SettingsManager.create(tempDir, agentDir);
+	const restartResourceLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager: restartSettingsManager,
+		extensionFactories: [memoryExtension as any],
+	});
+	await restartResourceLoader.reload();
+	const { session: restartedSession } = await createAgentSession({
+		cwd,
+		agentDir,
+		model,
+		settingsManager: restartSettingsManager,
+		sessionManager: SessionManager.inMemory(),
+		resourceLoader: restartResourceLoader,
+	});
+	await restartedSession.bindExtensions({});
+	const restartedTools = restartedSession.agent.state.tools.filter((tool: { name: string }) =>
+		tool.name.startsWith("memory__"),
+	);
+	const getRestartedTool = (name: string) => {
+		const tool = restartedTools.find((candidate: { name: string }) => candidate.name === name);
+		if (!tool) throw new Error(`restarted tool ${name} not found`);
+		return tool;
+	};
+	const restartedGraph = textOf(await getRestartedTool("memory__read_graph").execute("restart-read", {}));
+	if (!restartedGraph.includes("Prefers TypeScript") || !restartedGraph.includes("Vitest")) {
+		throw new Error(`restarted memory server did not restore persisted graph: ${restartedGraph}`);
+	}
+
+	// 7. Forget an entity through the restarted server.
+	const forgetRes = await getRestartedTool("memory__forget_entity").execute("call", { name: "Project" });
 	console.log(`[test] forget_entity(Project): ${textOf(forgetRes).split("\n")[0]}`);
-	const afterForget = textOf(await getTool("memory__read_graph").execute("call", {}));
+	const afterForget = textOf(await getRestartedTool("memory__read_graph").execute("call", {}));
 	if (afterForget.includes("Vitest")) {
 		throw new Error("Project entity still present after forget_entity");
 	}
 
-	session.dispose();
+	await restartedSession.shutdownExtensions("quit");
+	restartedSession.dispose();
 
-	try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	try {
+		rmSync(tempDir, { recursive: true, force: true });
+	} catch {
+		/* ignore */
+	}
 
 	console.log("\n[test] ✅ Memory extension end-to-end test passed");
 	faux.unregister();

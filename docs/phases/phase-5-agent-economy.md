@@ -13,7 +13,7 @@ Phase 5 implements the **Agent Economy** layer — three experimental primitives
 2. **AP2-style Payments** — A quote → invoice → payment → receipt flow following the Google Agentic Commerce AP2 protocol pattern, with a local mock wallet and ledger (human-in-the-loop approval before any payment).
 3. **Agent Discovery** — Public MCP server catalog search + a local JSON-based registry for tracking known A2A agents and their capabilities/price points.
 
-All three use **zero external dependencies** beyond Node.js built-in modules (`crypto`, `fs`, `path`), making them lightweight and avoiding native compilation issues.
+Ed25519 key generation/raw signing uses Node.js crypto, standards encoding uses `multiformats`, compact JWS uses `jose`, and agent-card discovery uses the official A2A SDK. The payment component is explicitly a local AP2-inspired simulator because the official AP2 project currently publishes reference schemas/implementations rather than a mature TypeScript payment SDK.
 
 ## Architecture
 
@@ -58,10 +58,11 @@ All three use **zero external dependencies** beyond Node.js built-in modules (`c
 **Standard:** [W3C Decentralized Identifiers (DIDs) v1.0](https://www.w3.org/TR/did-core/), `did:key` method (the simplest self-sovereign DID method, no blockchain required).
 
 **Implementation:**
-- Generates an Ed25519 keypair using Node.js native `crypto.generateKeyPairSync('ed25519')` (no external crypto libraries)
-- Public key is encoded using multicodec (`0xed01` for Ed25519) + base58btc multibase (`z` prefix) to produce the DID: `did:key:z6Mk...`
-- Private key is stored only in `~/.pi/identity/did.json` (file permissions respected, never transmitted)
-- Signs payloads using JWS (JSON Web Signature) with EdDSA algorithm
+- Generates an Ed25519 keypair using Node.js native `crypto.generateKeyPairSync('ed25519')`
+- Public key is encoded using multicodec (`0xed01` for Ed25519) + `multiformats` base58btc multibase (`z` prefix) to produce the DID: `did:key:z6Mk...`
+- Private key is stored only in `~/.pi/identity/did.json`; the directory is mode `0700` and the key file is mode `0600`
+- Signs/verifies standard compact JWS using `jose` with the EdDSA algorithm; raw Ed25519 mode signs the payload bytes directly
+- Verifies signatures by decoding the DID:key multicodec public key and importing it as an Ed25519 key
 - `kid` (Key ID) in JWS headers references the DID + public key multibase
 
 **Tools:**
@@ -69,23 +70,24 @@ All three use **zero external dependencies** beyond Node.js built-in modules (`c
 |------|---------|
 | `did_show` | Display this agent's DID, public key, creation date |
 | `did_sign` | Sign an arbitrary payload with Ed25519, return JWS |
+| `did_verify` | Verify a signature against the public key carried by a DID:key |
 
 **Files created:**
 - `~/.pi/identity/did.json` — persistent DID + private key
 
 ### Module 2: AP2-style Agent Payments
 
-**Standard:** Following the [Agent Payments Protocol (AP2)](https://ap2lab.com/) pattern from Google Agentic Commerce (announced September 2025, 60+ industry partners). AP2 defines quote → authorization → payment → receipt flows for agent commerce.
+**Reference:** Inspired by the official [Google Agentic Commerce AP2 repository](https://github.com/google-agentic-commerce/AP2). This module borrows the quote → approval → payment → receipt lifecycle, but it is not an AP2 network implementation or conformance claim.
 
 **Implementation:**
 - Mock wallet with initial balance of $1000 (simulated "pi-bucks", no real money)
 - Four-stage payment lifecycle:
   1. **Quote request** — Agent calls `ap2_request_quote(task, budget)` → returns `quote_id` with estimated price
-  2. **Human approval** — Payment requires explicit `ap2_pay(quote_id, max_amount)` call, enforcing human-in-the-loop
+  2. **Human approval** — `ap2_pay` calls the pi UI confirmation API and aborts without mutation if declined
   3. **Payment execution** — Deducts from wallet, generates invoice ID and receipt ID
-  4. **Ledger recording** — All transactions recorded in append-only JSON ledger
+  4. **Ledger recording** — Wallet, quotes, and transaction arrays are revalidated and atomically replaced while holding a cross-process file lock
 - Smart price estimation: price scales with task word count + complexity signals (code keywords like "implement", "debug", "database", etc.)
-- Safety checks: insufficient funds detection, expired quote detection, max amount enforcement
+- Safety checks: insufficient funds, expired/already-paid quote, strict budget/max amount checks, and concurrent duplicate-payment prevention
 
 **Tools:**
 | Tool | Purpose |
@@ -104,7 +106,7 @@ All three use **zero external dependencies** beyond Node.js built-in modules (`c
 
 **Files created:**
 - `~/.pi/economy/wallet.json` — wallet state
-- `~/.pi/economy/ledger.json` — append-only transaction ledger
+- `~/.pi/economy/ledger.json` — atomically replaced local transaction array (not an append-only/tamper-evident ledger)
 - `~/.pi/economy/quotes.json` — pending/paid/expired quotes
 
 ### Module 3: Agent Discovery
@@ -190,77 +192,39 @@ pi calls ap2_pay(quote_id="qt_abc123", max_amount=0.05)
 
 ## Test Results
 
-34 self-contained tests covering all three sub-modules (run: `node scripts/test-economy.mjs`):
+The extension-level test imports the real extension and checks 17 end-to-end assertions. Run it from `pi-main/` with:
 
+```bash
+./node_modules/.bin/tsx packages/coding-agent/examples/extensions/economy/scripts/test-economy.mjs
 ```
-[Module 1] DID:key Identity
-  ✓ DID starts with "did:key:z"
-  ✓ Public key multibase starts with "z"
-  ✓ Public key has reasonable length (48 chars)
-  ✓ Signature generated (86 chars, base64url)
-  ✓ Signature uses base64url (no + or /)
-  ✓ JWS has 3 parts (header.payload.signature)
-  ✓ JWS header alg is EdDSA
-  ✓ JWS kid references the signer DID
-  ✓ JWS payload includes issued-at timestamp
-  ✓ JWS payload contains custom claims
-  ✓ Two generated identities have different DIDs
-  ✓ Two generated identities have different private keys
 
-[Module 2] AP2-style Payments
-  ✓ Initial wallet balance is $1000
-  ✓ Simple task price is small: $0.01
-  ✓ Complex task costs more than simple
-  ✓ Quote saved
-  ✓ Balance decreased after payment
-  ✓ Quote state is 'paid' after payment
-  ✓ Ledger has one payment entry
-  ✓ Ledger entry type is 'payment'
-  ✓ Ledger entry references invoice ID
-  ✓ Correctly detects insufficient funds
-  ✓ Deposit works
-  ✓ Ledger accumulates entries
-
-[Module 3] Agent Discovery
-  ✓ Registry starts empty
-  ✓ Registered 4 agents
-  ✓ Found 2 coding agents
-  ✓ Found 1 math agent
-  ✓ Math agent correctly identified
-  ✓ Found 2 agents with refactoring capability
-  ✓ Updating existing URL doesn't create duplicate
-  ✓ Update correctly applied
-  ✓ Curated MCP fallback finds GitHub server
-  ✓ Curated MCP fallback finds browser server
-
-Results: 34 passed, 0 failed
-```
+The test covers isolated key storage, independent `jose` verification of compact JWS, valid/tampered verification, over-budget quote rejection, declined payment with no mutation, confirmed payment with exact deduction, two concurrent payments producing exactly one receipt/deduction, and registration through a live local A2A agent card.
 
 ## Design Decisions & Tradeoffs
 
 | Decision | Rationale |
 |----------|-----------|
-| **Zero external dependencies** | Node 18+ has native Ed25519 via `crypto`; JSON files for storage are sufficient for an experimental module; avoids `better-sqlite3` native compilation pain |
+| **Mature crypto/encoding libraries + official protocol SDK** | Node provides Ed25519 primitives, `jose` implements standard compact JWS, `multiformats` implements base58btc, and the official A2A SDK avoids hand-rolling agent-card discovery |
 | **DID:key method (not web5-js)** | DID:key is the simplest self-contained DID method (no ledger, no resolver needed). web5-js is heavyweight and has complex setup; for agent-to-agent identity verification, did:key is sufficient |
 | **Mock wallet, not real crypto/fiat** | AP2 is still an early specification; real payment rails (crypto/x402/Stripe test mode) would add significant complexity without adding resume value at the experimental stage |
 | **JSON files over SQLite** | Economy module data volume is tiny (few KB even after hundreds of transactions); JSON files are human-readable/auditable; no migration path needed |
-| **Human-in-the-loop enforced** | Payments require an explicit `ap2_pay` tool call separate from quote request, ensuring the LLM cannot spend money without user intent being clear in the conversation |
+| **Human-in-the-loop enforced** | Interactive `ap2_pay` calls invoke the pi UI confirmation API before entering the locked mutation path; declining leaves wallet, quote and ledger unchanged |
 | **Curated fallback for MCP search** | Public MCP catalog APIs are inconsistent and may be unavailable; curated fallback ensures the tool always returns useful results |
+
+JSON files remain an experimental local store: `proper-lockfile` plus atomic rename protects concurrent updates, but this is not a database transaction across crashes and does not make the ledger tamper-evident.
 
 ## Limitations & Future Work
 
 ### Current v0.1 Limitations
 
-1. **No real DID verification**: `verifySignature()` is permissive for unknown DIDs; full verification requires decoding base58 + multicodec + Ed25519 verify against raw public key
-2. **No Verifiable Credentials (VCs)**: Only bare DID + JWS signing, no VC issuance/verification
-3. **No push notifications for payments**: AP2 specifies webhook callbacks for payment events; not implemented
-4. **Mock currency only**: pi-bucks are fictional; no real USD/crypto integration
-5. **Single-agent wallet**: No multi-account or HD wallet support
-6. **Local-only discovery**: No peer-to-peer discovery or federated registry
+1. **No Verifiable Credentials (VCs)**: Only bare DID + JWS signing/verification, no VC issuance/verification
+2. **No push notifications for payments**: Payment event webhooks are not implemented
+3. **Mock currency only**: pi-bucks are fictional; no real USD/crypto integration
+4. **Single-agent wallet**: No multi-account or HD wallet support
+5. **Local-only discovery**: No peer-to-peer discovery or federated registry
 
 ### Future Enhancements (if the protocols mature)
 
-- Full DID verification with base58 decode + Ed25519 verify
 - x402 (HTTP 402 Payment Required) header support for paid API endpoints
 - VC issuance for agent capabilities ("this agent is certified for secure code review")
 - Integration with the A2A extension to auto-pay when delegating tasks to paid agents
@@ -271,16 +235,16 @@ Results: 34 passed, 0 failed
 
 | File | Purpose |
 |------|---------|
-| `extensions/economy/package.json` | Package metadata (zero external deps) |
+| `extensions/economy/package.json` | Package metadata and pinned workspace/runtime dependencies |
 | `extensions/economy/index.ts` | Main extension: identity + payments + discovery |
-| `extensions/economy/scripts/test-economy.mjs` | Self-contained test (34 tests, all passing) |
+| `extensions/economy/scripts/test-economy.mjs` | Real extension E2E test (17 assertions) |
 
 ## Resume Talking Point
 
-**"Experimental integration of agent economy primitives: W3C DID:key decentralized identity with Ed25519 JWS signing, AP2-aligned quote-to-payment flow with human-in-the-loop approval and local ledger, and multi-source agent discovery (public MCP catalog + local A2A registry). Zero external dependencies using Node.js native crypto."**
+**"Experimental integration of agent economy primitives: DID:key identity with standard compact EdDSA JWS (`jose` + `multiformats`), an explicitly local AP2-inspired quote-to-payment simulator with UI approval and concurrency-safe JSON mutation, and multi-source agent discovery using the official A2A SDK. It does not claim AP2 conformance or real payment-rail integration."**
 
 Interpretation for interviewers:
 - Frame as **tracking and experimenting with emerging standards** (not production-grade)
 - DID/VC is the W3C standard for self-sovereign identity, increasingly adopted in agent frameworks
-- AP2 is Google's bet on agent commerce with 60+ industry partners (Visa, Stripe, Shopify)
+- AP2 is an emerging Google-led agent-commerce project; describe this implementation as a simulator derived from its lifecycle, not as a production AP2 integration
 - The key insight is designing for human agency (explicit payment approval) even in autonomous agent systems

@@ -18,32 +18,33 @@
  */
 
 import { randomUUID } from "node:crypto";
-import express from "express";
 import {
-  A2A_PROTOCOL_VERSION,
-  type AgentCard,
-  AGENT_CARD_PATH,
-  Role,
-  TaskState,
-  type Task,
-  type TaskStatusUpdateEvent,
-  type TaskArtifactUpdateEvent,
-  type Artifact,
-  type Message,
-  type Part,
-  type TaskStatus,
+	A2A_PROTOCOL_VERSION,
+	AGENT_CARD_PATH,
+	type AgentCard,
+	type Artifact,
+	type Message,
+	type Part,
+	Role,
+	type Task,
+	type TaskArtifactUpdateEvent,
+	TaskState,
+	type TaskStatus,
+	type TaskStatusUpdateEvent,
 } from "@a2a-js/sdk";
+import { ClientFactory, ClientFactoryOptions, DefaultAgentCardResolver } from "@a2a-js/sdk/client";
 import {
-  InMemoryTaskStore,
-  DefaultRequestHandler,
-  type AgentExecutor,
-  type RequestContext,
-  type ExecutionEventBus,
-  AgentEvent,
+	AgentEvent,
+	type AgentExecutor,
+	DefaultRequestHandler,
+	type ExecutionEventBus,
+	InMemoryTaskStore,
+	type RequestContext,
 } from "@a2a-js/sdk/server";
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from "@a2a-js/sdk/server/express";
-import { ClientFactory } from "@a2a-js/sdk/client";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Api, AssistantMessage, Model } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import express from "express";
 import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
@@ -51,43 +52,80 @@ import { Type } from "typebox";
 // ---------------------------------------------------------------------------
 
 function textPart(text: string): Part {
-  return {
-    content: { $case: "text", value: text },
-    filename: "",
-    mediaType: "text/plain",
-    metadata: undefined,
-  };
+	return {
+		content: { $case: "text", value: text },
+		filename: "",
+		mediaType: "text/plain",
+		metadata: undefined,
+	};
 }
 
 function extractTextFromMessage(message: Message): string {
-  const parts: string[] = [];
-  for (const part of message.parts) {
-    if (part.content?.$case === "text") {
-      parts.push(part.content.value);
-    }
-  }
-  const text = parts.join("\n\n").trim();
-  return text || "(empty message)";
+	const parts: string[] = [];
+	for (const part of message.parts) {
+		if (part.content?.$case === "text") {
+			parts.push(part.content.value);
+		}
+	}
+	const text = parts.join("\n\n").trim();
+	return text || "(empty message)";
+}
+
+function extractTextFromAssistantMessage(message: AssistantMessage): string {
+	return message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
 }
 
 function extractTextFromArtifact(artifact: Artifact): string {
-  const parts: string[] = [];
-  for (const part of artifact.parts) {
-    if (part.content?.$case === "text") parts.push(part.content.value);
-  }
-  return parts.join("\n").trim();
+	const parts: string[] = [];
+	for (const part of artifact.parts) {
+		if (part.content?.$case === "text") parts.push(part.content.value);
+	}
+	return parts.join("\n");
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function validateAgentUrl(value: string): URL {
+	const url = new URL(value);
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error("A2A agent URL must use http or https");
+	}
+	if (url.username || url.password) throw new Error("A2A agent URL must not contain credentials");
+	if (url.hostname === "169.254.169.254" || url.hostname.toLowerCase() === "metadata.google.internal") {
+		throw new Error("Cloud metadata endpoints are not valid A2A agents");
+	}
+	return url;
+}
+
+async function createA2AClient(agentUrl: string, signal: AbortSignal) {
+	const url = validateAgentUrl(agentUrl);
+	const fetchWithSignal: typeof fetch = (input, init) => {
+		const combinedSignal = init?.signal ? AbortSignal.any([init.signal, signal]) : signal;
+		return fetch(input, { ...init, signal: combinedSignal });
+	};
+	const options = ClientFactoryOptions.createFrom(ClientFactoryOptions.default, {
+		cardResolver: new DefaultAgentCardResolver({ fetchImpl: fetchWithSignal }),
+	});
+	return new ClientFactory(options).createFromUrl(url.toString());
 }
 
 function extractTextFromTask(task: Task): string {
-  // Collect text from all artifacts
-  const texts: string[] = [];
-  if (task.artifacts) {
-    for (const art of task.artifacts) {
-      const t = extractTextFromArtifact(art);
-      if (t) texts.push(t);
-    }
-  }
-  return texts.join("\n\n").trim();
+	// Collect text from all artifacts
+	const texts: string[] = [];
+	if (task.artifacts) {
+		for (const art of task.artifacts) {
+			const t = extractTextFromArtifact(art);
+			if (t) texts.push(t);
+		}
+	}
+	return texts.join("\n\n").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -95,244 +133,291 @@ function extractTextFromTask(task: Task): string {
 // ---------------------------------------------------------------------------
 
 function createPiAgentCard(port: number): AgentCard {
-  return {
-    name: "pi Coding Agent",
-    description:
-      "pi is a terminal-first AI coding agent. It can read/write files, run bash commands, edit code, and complete software engineering tasks. This A2A endpoint accepts text-based coding tasks and returns results.",
-    supportedInterfaces: [
-      {
-        url: `http://localhost:${port}/`,
-        protocolBinding: "JSONRPC",
-        tenant: "",
-        protocolVersion: A2A_PROTOCOL_VERSION,
-      },
-    ],
-    provider: {
-      organization: "pi-agent-czh",
-      url: "https://github.com/Coder-yui/pi-agent-czh",
-    },
-    version: "0.1.0",
-    capabilities: {
-      streaming: true,
-      pushNotifications: false,
-      extensions: [],
-      extendedAgentCard: false,
-    },
-    securitySchemes: {},
-    securityRequirements: [],
-    defaultInputModes: ["text"],
-    defaultOutputModes: ["text", "task-status"],
-    skills: [
-      {
-        id: "coding",
-        name: "Code Writing & Editing",
-        description:
-          "Write, edit, debug, and refactor code in any programming language. Currently responds via direct model inference (no tool execution in A2A mode v0.1).",
-        tags: ["coding", "programming", "debugging", "refactoring"],
-        examples: [
-          "Write a Python function to parse CSV files",
-          "Explain what this code does",
-          "Suggest a refactoring approach",
-        ],
-        inputModes: ["text"],
-        outputModes: ["text", "task-status"],
-        securityRequirements: [],
-      },
-    ],
-    documentationUrl: "https://github.com/Coder-yui/pi-agent-czh",
-    signatures: [],
-  };
+	return {
+		name: "pi Coding Agent",
+		description:
+			"A text-based pi model endpoint for coding questions, explanations, and code generation. A2A requests do not receive filesystem, shell, or extension-tool access.",
+		supportedInterfaces: [
+			{
+				url: `http://localhost:${port}/`,
+				protocolBinding: "JSONRPC",
+				tenant: "",
+				protocolVersion: A2A_PROTOCOL_VERSION,
+			},
+		],
+		provider: {
+			organization: "pi-agent-czh",
+			url: "https://github.com/Coder-yui/pi-agent-czh",
+		},
+		version: "0.1.0",
+		capabilities: {
+			streaming: true,
+			pushNotifications: false,
+			extensions: [],
+			extendedAgentCard: false,
+		},
+		securitySchemes: {},
+		securityRequirements: [],
+		defaultInputModes: ["text"],
+		defaultOutputModes: ["text", "task-status"],
+		skills: [
+			{
+				id: "coding-advice",
+				name: "Coding Advice and Generation",
+				description:
+					"Answer coding questions, explain code, and generate suggested code through direct model inference without tool execution.",
+				tags: ["coding", "programming", "explanation", "generation"],
+				examples: [
+					"Write a Python function to parse CSV files",
+					"Explain what this code does",
+					"Suggest a refactoring approach",
+				],
+				inputModes: ["text"],
+				outputModes: ["text", "task-status"],
+				securityRequirements: [],
+			},
+		],
+		documentationUrl: "https://github.com/Coder-yui/pi-agent-czh",
+		signatures: [],
+	};
 }
 
 // ---------------------------------------------------------------------------
 // AgentExecutor: bridges A2A tasks → pi model responses
 // ---------------------------------------------------------------------------
 
+interface A2ARuntime {
+	model: Model<Api>;
+	modelRegistry: ModelRegistry;
+}
+
+interface RunningTask {
+	controller: AbortController;
+	contextId: string;
+	terminalPublished: boolean;
+}
+
 class PiA2AExecutor implements AgentExecutor {
-  private cancelledTasks = new Set<string>();
-  private getModel: () => any;
+	private readonly runningTasks = new Map<string, RunningTask>();
+	private readonly getModel: () => A2ARuntime | null;
 
-  constructor(getModel: () => any) {
-    this.getModel = getModel;
-  }
+	constructor(getModel: () => A2ARuntime | null) {
+		this.getModel = getModel;
+	}
 
-  cancelTask = async (taskId: string, _eventBus: ExecutionEventBus): Promise<void> => {
-    this.cancelledTasks.add(taskId);
-  };
+	cancelTask = async (taskId: string, eventBus: ExecutionEventBus): Promise<void> => {
+		const runningTask = this.runningTasks.get(taskId);
+		if (!runningTask) return;
+		runningTask.controller.abort(new Error("A2A task canceled by client"));
+		this.publishCanceled(eventBus, taskId, runningTask.contextId);
+		runningTask.terminalPublished = true;
+	};
 
-  async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
-    const userMessage = requestContext.userMessage;
-    const existingTask = requestContext.task;
-    const taskId = requestContext.taskId;
-    const contextId = requestContext.contextId;
+	async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+		const userMessage = requestContext.userMessage;
+		const existingTask = requestContext.task;
+		const taskId = requestContext.taskId;
+		const contextId = requestContext.contextId;
+		const runningTask: RunningTask = {
+			controller: new AbortController(),
+			contextId,
+			terminalPublished: false,
+		};
+		this.runningTasks.set(taskId, runningTask);
 
-    try {
-      // 1. Publish initial Task snapshot (required as first event)
-      const initialStatus: TaskStatus = {
-        state: TaskState.TASK_STATE_SUBMITTED,
-        timestamp: new Date().toISOString(),
-      };
-      const taskSnapshot: Task = existingTask ?? {
-        id: taskId,
-        contextId,
-        status: initialStatus,
-        artifacts: [],
-        history: [userMessage],
-        metadata: userMessage.metadata,
-      };
-      eventBus.publish(AgentEvent.task(taskSnapshot));
+		try {
+			// 1. Publish initial Task snapshot (required as first event)
+			const initialStatus: TaskStatus = {
+				state: TaskState.TASK_STATE_SUBMITTED,
+				message: undefined,
+				timestamp: new Date().toISOString(),
+			};
+			const taskSnapshot: Task = existingTask ?? {
+				id: taskId,
+				contextId,
+				status: initialStatus,
+				artifacts: [],
+				history: [userMessage],
+				metadata: userMessage.metadata,
+			};
+			eventBus.publish(AgentEvent.task(taskSnapshot));
 
-      // 2. Publish working status
-      const workingStatusMsg: Message = {
-        role: Role.ROLE_AGENT,
-        messageId: randomUUID(),
-        contextId,
-        taskId,
-        parts: [textPart("Processing your request with pi...")],
-        metadata: {},
-        extensions: [],
-        referenceTaskIds: [],
-      };
-      const workingUpdate: TaskStatusUpdateEvent = {
-        taskId,
-        contextId,
-        status: {
-          state: TaskState.TASK_STATE_WORKING,
-          message: workingStatusMsg,
-          timestamp: new Date().toISOString(),
-        },
-        metadata: {},
-      };
-      eventBus.publish(AgentEvent.statusUpdate(workingUpdate));
+			// 2. Publish working status
+			const workingStatusMsg: Message = {
+				role: Role.ROLE_AGENT,
+				messageId: randomUUID(),
+				contextId,
+				taskId,
+				parts: [textPart("Processing your request with pi...")],
+				metadata: {},
+				extensions: [],
+				referenceTaskIds: [],
+			};
+			const workingUpdate: TaskStatusUpdateEvent = {
+				taskId,
+				contextId,
+				status: {
+					state: TaskState.TASK_STATE_WORKING,
+					message: workingStatusMsg,
+					timestamp: new Date().toISOString(),
+				},
+				metadata: {},
+			};
+			eventBus.publish(AgentEvent.statusUpdate(workingUpdate));
 
-      if (this.cancelledTasks.has(taskId)) {
-        this.publishCanceled(eventBus, taskId, contextId);
-        return;
-      }
+			// 3. Extract text and call the model
+			const userText = extractTextFromMessage(userMessage);
+			const runtime = this.getModel();
+			if (!runtime) {
+				this.publishFailed(
+					eventBus,
+					taskId,
+					contextId,
+					"A2A server is running but no model is selected. Configure a model before sending tasks.",
+				);
+				runningTask.terminalPublished = true;
+				return;
+			}
 
-      // 3. Extract text and call the model
-      const userText = extractTextFromMessage(userMessage);
-      const model = this.getModel();
-      if (!model) {
-        const errText =
-          "A2A server running but no model is selected. Start pi with a configured model provider to respond to tasks.";
-        this.publishErrorArtifact(eventBus, taskId, contextId, errText);
-        this.publishCompleted(eventBus, taskId, contextId);
-        return;
-      }
-
-      const systemPrompt = `You are pi, a terminal-first AI coding agent exposed via the A2A (Agent2Agent) protocol.
+			const systemPrompt = `You are pi, a terminal-first AI coding agent exposed via the A2A (Agent2Agent) protocol.
 You are responding to a task delegated to you by another agent.
 Provide clear, concise, actionable responses. If the task involves code, write correct, well-structured code.
 Be direct and helpful. Do not include unnecessary preamble.`;
 
-      let responseText = "";
-      try {
-        // Try streaming first; fall back to non-streaming complete
-        if (typeof model.completeStream === "function") {
-          const chunks: string[] = [];
-          const stream = model.completeStream(
-            {
-              systemPrompt,
-              messages: [{ role: "user", content: [{ type: "text", text: userText }] }],
-            },
-            { signal: AbortSignal.timeout(120000) },
-          );
-          for await (const chunk of stream) {
-            if (this.cancelledTasks.has(taskId)) break;
-            const delta =
-              typeof chunk === "string" ? chunk : chunk?.delta ?? chunk?.text ?? "";
-            if (delta) chunks.push(delta);
-          }
-          responseText = chunks.join("");
-        } else {
-          const result = await model.complete(
-            {
-              systemPrompt,
-              messages: [{ role: "user", content: [{ type: "text", text: userText }] }],
-            },
-            { signal: AbortSignal.timeout(120000) },
-          );
-          responseText =
-            result.content
-              ?.filter((c: any) => c.type === "text")
-              .map((c: any) => c.text)
-              .join("\n") ?? "";
-        }
-      } catch (err: any) {
-        responseText = `Error processing task: ${err?.message ?? String(err)}`;
-      }
+			const stream = runtime.modelRegistry.stream(
+				runtime.model,
+				{
+					systemPrompt,
+					messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }],
+				},
+				{ signal: AbortSignal.any([runningTask.controller.signal, AbortSignal.timeout(120_000)]) },
+			);
+			const artifactId = randomUUID();
+			let pendingDelta = "";
+			let publishedChunk = false;
+			let finalResponse = "";
+			for await (const modelEvent of stream) {
+				if (modelEvent.type === "text_delta") {
+					if (pendingDelta) {
+						this.publishArtifactChunk(
+							eventBus,
+							taskId,
+							contextId,
+							artifactId,
+							pendingDelta,
+							publishedChunk,
+							false,
+						);
+						publishedChunk = true;
+					}
+					pendingDelta = modelEvent.delta;
+				} else if (modelEvent.type === "done") {
+					finalResponse = extractTextFromAssistantMessage(modelEvent.message);
+				} else if (modelEvent.type === "error") {
+					throw new Error(modelEvent.error.errorMessage ?? `Model request ${modelEvent.reason}`);
+				}
+			}
 
-      if (this.cancelledTasks.has(taskId)) {
-        this.publishCanceled(eventBus, taskId, contextId);
-        return;
-      }
+			if (pendingDelta) {
+				this.publishArtifactChunk(eventBus, taskId, contextId, artifactId, pendingDelta, publishedChunk, true);
+			} else if (!publishedChunk) {
+				this.publishArtifactChunk(
+					eventBus,
+					taskId,
+					contextId,
+					artifactId,
+					finalResponse.trim() || "(empty response from model)",
+					false,
+					true,
+				);
+			}
 
-      if (!responseText.trim()) {
-        responseText = "(empty response from model)";
-      }
+			this.publishCompleted(eventBus, taskId, contextId);
+			runningTask.terminalPublished = true;
+		} catch (error: unknown) {
+			if (runningTask.terminalPublished) return;
+			if (runningTask.controller.signal.aborted) {
+				this.publishCanceled(eventBus, taskId, contextId);
+			} else {
+				this.publishFailed(eventBus, taskId, contextId, errorMessage(error));
+			}
+			runningTask.terminalPublished = true;
+		} finally {
+			this.runningTasks.delete(taskId);
+		}
+	}
 
-      // 4. Publish result artifact
-      const artifact: Artifact = {
-        artifactId: randomUUID(),
-        name: "Result",
-        description: "pi's response to the task",
-        parts: [textPart(responseText)],
-        extensions: [],
-      };
-      const artifactUpdate: TaskArtifactUpdateEvent = {
-        taskId,
-        contextId,
-        artifact,
-        lastChunk: true,
-        append: false,
-      };
-      eventBus.publish(AgentEvent.artifactUpdate(artifactUpdate));
+	private publishCanceled(eventBus: ExecutionEventBus, taskId: string, contextId: string) {
+		const update: TaskStatusUpdateEvent = {
+			taskId,
+			contextId,
+			status: { state: TaskState.TASK_STATE_CANCELED, message: undefined, timestamp: new Date().toISOString() },
+			metadata: {},
+		};
+		eventBus.publish(AgentEvent.statusUpdate(update));
+	}
 
-      // 5. Publish completed status
-      this.publishCompleted(eventBus, taskId, contextId);
-    } finally {
-      this.cancelledTasks.delete(taskId);
-    }
-  }
+	private publishCompleted(eventBus: ExecutionEventBus, taskId: string, contextId: string) {
+		const update: TaskStatusUpdateEvent = {
+			taskId,
+			contextId,
+			status: { state: TaskState.TASK_STATE_COMPLETED, message: undefined, timestamp: new Date().toISOString() },
+			metadata: {},
+		};
+		eventBus.publish(AgentEvent.statusUpdate(update));
+	}
 
-  private publishCanceled(eventBus: ExecutionEventBus, taskId: string, contextId: string) {
-    const update: TaskStatusUpdateEvent = {
-      taskId,
-      contextId,
-      status: { state: TaskState.TASK_STATE_CANCELED, timestamp: new Date().toISOString() },
-      metadata: {},
-    };
-    eventBus.publish(AgentEvent.statusUpdate(update));
-  }
+	private publishFailed(eventBus: ExecutionEventBus, taskId: string, contextId: string, errorText: string) {
+		const message: Message = {
+			role: Role.ROLE_AGENT,
+			messageId: randomUUID(),
+			contextId,
+			taskId,
+			parts: [textPart(errorText)],
+			metadata: {},
+			extensions: [],
+			referenceTaskIds: [],
+		};
+		const update: TaskStatusUpdateEvent = {
+			taskId,
+			contextId,
+			status: {
+				state: TaskState.TASK_STATE_FAILED,
+				message,
+				timestamp: new Date().toISOString(),
+			},
+			metadata: {},
+		};
+		eventBus.publish(AgentEvent.statusUpdate(update));
+	}
 
-  private publishCompleted(eventBus: ExecutionEventBus, taskId: string, contextId: string) {
-    const update: TaskStatusUpdateEvent = {
-      taskId,
-      contextId,
-      status: { state: TaskState.TASK_STATE_COMPLETED, timestamp: new Date().toISOString() },
-      metadata: {},
-    };
-    eventBus.publish(AgentEvent.statusUpdate(update));
-  }
-
-  private publishErrorArtifact(
-    eventBus: ExecutionEventBus,
-    taskId: string,
-    contextId: string,
-    errorText: string,
-  ) {
-    const artifact: Artifact = {
-      artifactId: randomUUID(),
-      name: "Error",
-      description: "Error information",
-      parts: [textPart(errorText)],
-      extensions: [],
-    };
-    eventBus.publish(
-      AgentEvent.artifactUpdate({ taskId, contextId, artifact, lastChunk: true, append: false }),
-    );
-  }
+	private publishArtifactChunk(
+		eventBus: ExecutionEventBus,
+		taskId: string,
+		contextId: string,
+		artifactId: string,
+		text: string,
+		append: boolean,
+		lastChunk: boolean,
+	) {
+		const artifact: Artifact = {
+			artifactId,
+			name: "Result",
+			description: "pi's response to the task",
+			parts: [textPart(text)],
+			metadata: undefined,
+			extensions: [],
+		};
+		const update: TaskArtifactUpdateEvent = {
+			taskId,
+			contextId,
+			artifact,
+			lastChunk,
+			append,
+			metadata: undefined,
+		};
+		eventBus.publish(AgentEvent.artifactUpdate(update));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -340,323 +425,335 @@ Be direct and helpful. Do not include unnecessary preamble.`;
 // ---------------------------------------------------------------------------
 
 interface A2AServerState {
-  app: express.Express;
-  server: ReturnType<express.Express["listen"]>;
-  port: number;
+	app: express.Express;
+	server: ReturnType<express.Express["listen"]>;
+	port: number;
 }
 
 const DELEGATE_PARAMS = Type.Object({
-  agent_url: Type.String({
-    description: "Base URL of the remote A2A agent (e.g. http://localhost:41241)",
-  }),
-  task: Type.String({
-    description: "Description of the task to delegate to the remote agent",
-  }),
-  context: Type.Optional(
-    Type.String({
-      description: "Optional additional context to provide to the remote agent",
-    }),
-  ),
+	agent_url: Type.String({
+		description: "Base URL of the remote A2A agent (e.g. http://localhost:41241)",
+	}),
+	task: Type.String({
+		description: "Description of the task to delegate to the remote agent",
+	}),
+	context: Type.Optional(
+		Type.String({
+			description: "Optional additional context to provide to the remote agent",
+		}),
+	),
 });
 
 const DISCOVER_PARAMS = Type.Object({
-  agent_url: Type.String({ description: "Base URL of the remote A2A agent" }),
+	agent_url: Type.String({ description: "Base URL of the remote A2A agent" }),
 });
 
 export default function a2aExtension(pi: ExtensionAPI) {
-  let serverState: A2AServerState | null = null;
+	let serverState: A2AServerState | null = null;
+	let currentRuntime: A2ARuntime | null = null;
+	const getCurrentModel = () => currentRuntime;
 
-  // Try to access the current model from pi's runtime.
-  // Extensions loaded via -e have access to pi's session; we try common access paths.
-  const getCurrentModel = (): any => {
-    // Pi sessions typically expose model via session.model or the runtime.
-    // We try a few access patterns; if none work, the executor will return an error.
-    const session = (pi as any).session;
-    if (session?.model) return session.model;
-    if (session?.modelRuntime) {
-      try {
-        const def = session.modelRuntime.getDefaultModel?.();
-        if (def) return def;
-      } catch { /* noop */ }
-    }
-    const runtime = (pi as any).modelRuntime;
-    if (runtime) {
-      try { return runtime.getDefaultModel?.() ?? null; } catch { /* noop */ }
-    }
-    return null;
-  };
+	// ---- Tools ----
 
-  // ---- Tools ----
+	pi.registerTool({
+		name: "a2a_delegate",
+		label: "A2A Delegate Task",
+		description:
+			"Delegate a subtask to a remote A2A (Agent2Agent) agent. Discovers the agent's card from its URL, sends the task via JSON-RPC streaming, collects status updates and artifacts, and returns the final result. Use this when you want another agent to do work for you.",
+		promptSnippet: "Delegate a subtask to a remote A2A agent at the given URL",
+		promptGuidelines: [
+			"Use a2a_delegate when a task would benefit from a specialized remote agent.",
+			"Provide a clear, self-contained task description with all necessary context.",
+			"The agent_url must be a reachable HTTP base URL (the agent card is at /.well-known/agent-card.json).",
+		],
+		parameters: DELEGATE_PARAMS,
+		async execute(_toolCallId, params, signal) {
+			const { agent_url, task, context } = params;
+			try {
+				const requestSignal = withTimeout(signal, 120_000);
+				const client = await createA2AClient(agent_url, requestSignal);
 
-  pi.registerTool({
-    name: "a2a_delegate",
-    label: "A2A Delegate Task",
-    description:
-      "Delegate a subtask to a remote A2A (Agent2Agent) agent. Discovers the agent's card from its URL, sends the task via JSON-RPC streaming, collects status updates and artifacts, and returns the final result. Use this when you want another agent to do work for you.",
-    promptSnippet: "Delegate a subtask to a remote A2A agent at the given URL",
-    promptGuidelines: [
-      "Use a2a_delegate when a task would benefit from a specialized remote agent.",
-      "Provide a clear, self-contained task description with all necessary context.",
-      "The agent_url must be a reachable HTTP base URL (the agent card is at /.well-known/agent-card.json).",
-    ],
-    parameters: DELEGATE_PARAMS,
-    async execute(_toolCallId, params) {
-      const { agent_url, task, context } = params;
-      try {
-        const clientFactory = new ClientFactory();
-        const client = await clientFactory.createFromUrl(agent_url);
+				const messageText = context ? `${task}\n\nAdditional context:\n${context}` : task;
+				const userMessage: Message = {
+					role: Role.ROLE_USER,
+					messageId: randomUUID(),
+					contextId: "",
+					taskId: "",
+					parts: [textPart(messageText)],
+					metadata: {},
+					extensions: [],
+					referenceTaskIds: [],
+				};
 
-        const messageText = context ? `${task}\n\nAdditional context:\n${context}` : task;
-        const userMessage: Message = {
-          role: Role.ROLE_USER,
-          messageId: randomUUID(),
-          contextId: "",
-          taskId: "",
-          parts: [textPart(messageText)],
-          metadata: {},
-          extensions: [],
-          referenceTaskIds: [],
-        };
+				let finalText = "";
+				const statusLines: string[] = [];
+				const artifactTexts = new Map<string, string>();
+				let receivedPayload = false;
+				let terminalState: TaskState | undefined;
 
-        let finalText = "";
-        const statusLines: string[] = [];
+				try {
+					const stream = client.sendMessageStream(
+						{
+							tenant: "",
+							message: userMessage,
+							configuration: undefined,
+							metadata: undefined,
+						},
+						{ signal: requestSignal },
+					);
+					for await (const resp of stream) {
+						const payload = resp.payload;
+						if (!payload) continue;
+						receivedPayload = true;
+						const kind = payload.$case;
+						if (kind === "statusUpdate") {
+							const evt = payload.value;
+							const state = evt.status?.state;
+							terminalState = state;
+							const msg = evt.status?.message ? extractTextFromMessage(evt.status.message) : "";
+							if (msg) statusLines.push(`- [${state}] ${msg}`);
+						} else if (kind === "artifactUpdate") {
+							const art = payload.value.artifact;
+							if (art) {
+								const t = extractTextFromArtifact(art);
+								if (payload.value.append) {
+									artifactTexts.set(art.artifactId, `${artifactTexts.get(art.artifactId) ?? ""}${t}`);
+								} else {
+									artifactTexts.set(art.artifactId, t);
+								}
+							}
+						} else if (kind === "task") {
+							const t = extractTextFromTask(payload.value);
+							if (t && artifactTexts.size === 0) finalText = t;
+						} else if (kind === "message") {
+							const txt = extractTextFromMessage(payload.value);
+							if (txt) finalText += (finalText ? "\n" : "") + txt;
+						}
+					}
+				} catch (error: unknown) {
+					if (receivedPayload) throw error;
+					const result = await client.sendMessage(
+						{
+							tenant: "",
+							message: userMessage,
+							configuration: undefined,
+							metadata: undefined,
+						},
+						{ signal: requestSignal },
+					);
+					if ("artifacts" in result && result.artifacts) {
+						for (const art of result.artifacts) {
+							const t = extractTextFromArtifact(art);
+							if (t) finalText += (finalText ? "\n\n" : "") + t;
+						}
+					} else if ("parts" in result) {
+						finalText = extractTextFromMessage(result);
+					}
+				}
+				if (artifactTexts.size > 0) finalText = [...artifactTexts.values()].filter(Boolean).join("\n\n");
+				if (terminalState === TaskState.TASK_STATE_FAILED) throw new Error("Remote A2A task failed");
+				if (terminalState === TaskState.TASK_STATE_CANCELED) throw new Error("Remote A2A task was canceled");
 
-        try {
-          const stream = client.sendMessageStream({ message: userMessage });
-          for await (const resp of stream) {
-            const kind = resp.payload?.$case;
-            if (!kind) continue;
-            if (kind === "statusUpdate") {
-              const evt = resp.payload.value;
-              const state = evt.status?.state ?? "unknown";
-              let msg = "";
-              if (evt.status?.message?.parts) {
-                msg = evt.status.message.parts
-                  .filter((p) => p.content?.$case === "text")
-                  .map((p) => (p.content as any).value)
-                  .join(" ");
-              }
-              if (msg) statusLines.push(`- [${state}] ${msg}`);
-            } else if (kind === "artifactUpdate") {
-              const art = resp.payload.value.artifact;
-              if (art) {
-                const t = extractTextFromArtifact(art);
-                if (t) finalText += (finalText ? "\n\n" : "") + t;
-              }
-            } else if (kind === "task") {
-              const t = extractTextFromTask(resp.payload.value);
-              if (t) finalText = t;
-            } else if (kind === "message") {
-              const m = resp.payload.value;
-              const txt = m.parts
-                .filter((p) => p.content?.$case === "text")
-                .map((p) => (p.content as any).value)
-                .join("\n");
-              if (txt) finalText += (finalText ? "\n" : "") + txt;
-            }
-          }
-        } catch (streamErr: any) {
-          // Fallback to non-streaming
-          const result = await client.sendMessage({ message: userMessage });
-          if ("artifacts" in result && result.artifacts) {
-            for (const art of result.artifacts) {
-              const t = extractTextFromArtifact(art);
-              if (t) finalText += (finalText ? "\n\n" : "") + t;
-            }
-          } else if ("parts" in result) {
-            finalText = result.parts
-              .filter((p) => p.content?.$case === "text")
-              .map((p) => (p.content as any).value)
-              .join("\n");
-          }
-        }
+				const card = await client.getAgentCard({ signal: requestSignal });
+				const lines = [
+					`### Delegated to A2A agent: ${card.name}`,
+					"",
+					`**URL:** ${agent_url}`,
+					`**Agent description:** ${card.description ?? "(none)"}`,
+					"",
+				];
+				if (statusLines.length > 0) {
+					lines.push("**Status updates:**", ...statusLines, "");
+				}
+				lines.push("**Result:**", finalText || "(no text result returned)");
 
-        const lines = [
-          `### Delegated to A2A agent: ${client.agentCard.name}`,
-          "",
-          `**URL:** ${agent_url}`,
-          `**Agent description:** ${client.agentCard.description ?? "(none)"}`,
-          "",
-        ];
-        if (statusLines.length > 0) {
-          lines.push("**Status updates:**", ...statusLines, "");
-        }
-        lines.push("**Result:**", finalText || "(no text result returned)");
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { agent_url, task_sent: task },
+				};
+			} catch (error: unknown) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Failed to delegate to A2A agent at ${agent_url}: ${errorMessage(error)}`,
+						},
+					],
+					isError: true,
+					details: undefined,
+				};
+			}
+		},
+	});
 
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { agent_url, task_sent: task },
-        };
-      } catch (err: any) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to delegate to A2A agent at ${agent_url}: ${err?.message ?? String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
-  });
+	pi.registerTool({
+		name: "a2a_discover",
+		label: "A2A Discover Agent",
+		description:
+			"Discover a remote A2A agent by fetching and displaying its agent card. Shows name, description, skills, capabilities, and supported protocols. Use this before delegating to understand what the agent can do.",
+		promptSnippet: "Discover a remote A2A agent's capabilities",
+		parameters: DISCOVER_PARAMS,
+		async execute(_toolCallId, params, signal) {
+			try {
+				const requestSignal = withTimeout(signal, 15_000);
+				const client = await createA2AClient(params.agent_url, requestSignal);
+				const card = await client.getAgentCard({ signal: requestSignal });
 
-  pi.registerTool({
-    name: "a2a_discover",
-    label: "A2A Discover Agent",
-    description:
-      "Discover a remote A2A agent by fetching and displaying its agent card. Shows name, description, skills, capabilities, and supported protocols. Use this before delegating to understand what the agent can do.",
-    promptSnippet: "Discover a remote A2A agent's capabilities",
-    parameters: DISCOVER_PARAMS,
-    async execute(_toolCallId, params) {
-      try {
-        const clientFactory = new ClientFactory();
-        const client = await clientFactory.createFromUrl(params.agent_url);
-        const card = client.agentCard;
+				const info = [
+					`### A2A Agent: ${card.name}`,
+					"",
+					`**Description:** ${card.description ?? "(none)"}`,
+					`**Version:** ${card.version ?? "unknown"}`,
+					`**Protocol version:** ${A2A_PROTOCOL_VERSION}`,
+					`**Provider:** ${card.provider?.organization ?? "unknown"}`,
+					"",
+					"**Capabilities:**",
+					`- Streaming: ${card.capabilities?.streaming ? "yes" : "no"}`,
+					`- Push notifications: ${card.capabilities?.pushNotifications ? "yes" : "no"}`,
+					"",
+					"**Skills:**",
+					...(card.skills?.map(
+						(s) =>
+							`- **${s.name}** (${s.id}): ${s.description}${s.tags?.length ? ` [tags: ${s.tags.join(", ")}]` : ""}`,
+					) ?? ["(none)"]),
+					"",
+					"**Interfaces:**",
+					...(card.supportedInterfaces?.map(
+						(i) => `- ${i.protocolBinding} @ ${i.url} (v${i.protocolVersion})`,
+					) ?? ["(none)"]),
+				].join("\n");
 
-        const info = [
-          `### A2A Agent: ${card.name}`,
-          "",
-          `**Description:** ${card.description ?? "(none)"}`,
-          `**Version:** ${card.version ?? "unknown"}`,
-          `**Protocol version:** ${A2A_PROTOCOL_VERSION}`,
-          `**Provider:** ${card.provider?.organization ?? "unknown"}`,
-          "",
-          "**Capabilities:**",
-          `- Streaming: ${card.capabilities?.streaming ? "yes" : "no"}`,
-          `- Push notifications: ${card.capabilities?.pushNotifications ? "yes" : "no"}`,
-          "",
-          "**Skills:**",
-          ...(card.skills?.map(
-            (s) =>
-              `- **${s.name}** (${s.id}): ${s.description}${s.tags?.length ? ` [tags: ${s.tags.join(", ")}]` : ""}`,
-          ) ?? ["(none)"]),
-          "",
-          "**Interfaces:**",
-          ...(card.supportedInterfaces?.map(
-            (i) => `- ${i.protocolBinding} @ ${i.url} (v${i.protocolVersion})`,
-          ) ?? ["(none)"]),
-        ].join("\n");
+				return { content: [{ type: "text", text: info }], details: undefined };
+			} catch (error: unknown) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Failed to discover agent at ${params.agent_url}: ${errorMessage(error)}`,
+						},
+					],
+					isError: true,
+					details: undefined,
+				};
+			}
+		},
+	});
 
-        return { content: [{ type: "text", text: info }] };
-      } catch (err: any) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to discover agent at ${params.agent_url}: ${err?.message ?? String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
-  });
+	// ---- Commands ----
 
-  // ---- Commands ----
+	pi.registerCommand("a2a", {
+		description: "A2A protocol control: /a2a start [port] | stop | status | discover <url>",
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const subcmd = (parts[0] ?? "status").toLowerCase();
 
-  pi.registerCommand("a2a", {
-    description: "A2A protocol control: /a2a start [port] | stop | status | discover <url>",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const subcmd = (parts[0] ?? "status").toLowerCase();
+			if (subcmd === "start" || subcmd === "on") {
+				if (serverState) {
+					ctx.ui.notify(`A2A server already running on port ${serverState.port}`, "warning");
+					return;
+				}
+				const port = parseInt(parts[1] ?? "41241", 10);
+				if (Number.isNaN(port) || port < 1 || port > 65535) {
+					ctx.ui.notify(`Invalid port: ${parts[1]}`, "error");
+					return;
+				}
+				try {
+					currentRuntime = ctx.model ? { model: ctx.model, modelRegistry: ctx.modelRegistry } : null;
+					serverState = await startServer(getCurrentModel, port);
+					ctx.ui.notify(`A2A server started on http://localhost:${port}`, "info");
+					ctx.ui.notify(`Agent card: http://localhost:${port}${AGENT_CARD_PATH}`, "info");
+				} catch (error: unknown) {
+					ctx.ui.notify(`Failed to start A2A server: ${errorMessage(error)}`, "error");
+					serverState = null;
+				}
+				return;
+			}
 
-      if (subcmd === "start" || subcmd === "on") {
-        if (serverState) {
-          ctx.ui.notify(`A2A server already running on port ${serverState.port}`, "warning");
-          return;
-        }
-        const port = parseInt(parts[1] ?? "41241", 10);
-        if (Number.isNaN(port) || port < 1 || port > 65535) {
-          ctx.ui.notify(`Invalid port: ${parts[1]}`, "error");
-          return;
-        }
-        try {
-          serverState = startServer(getCurrentModel, port);
-          ctx.ui.notify(`A2A server started on http://localhost:${port}`, "info");
-          ctx.ui.notify(`Agent card: http://localhost:${port}${AGENT_CARD_PATH}`, "info");
-        } catch (err: any) {
-          ctx.ui.notify(`Failed to start A2A server: ${err?.message ?? String(err)}`, "error");
-          serverState = null;
-        }
-        return;
-      }
+			if (subcmd === "stop" || subcmd === "off") {
+				if (!serverState) {
+					ctx.ui.notify("A2A server is not running", "warning");
+					return;
+				}
+				await new Promise<void>((resolve) => {
+					serverState!.server.close(() => resolve());
+				});
+				ctx.ui.notify(`A2A server stopped (was on port ${serverState.port})`, "info");
+				serverState = null;
+				return;
+			}
 
-      if (subcmd === "stop" || subcmd === "off") {
-        if (!serverState) {
-          ctx.ui.notify("A2A server is not running", "warning");
-          return;
-        }
-        await new Promise<void>((resolve) => {
-          serverState!.server.close(() => resolve());
-        });
-        ctx.ui.notify(`A2A server stopped (was on port ${serverState.port})`, "info");
-        serverState = null;
-        return;
-      }
+			if (subcmd === "discover") {
+				const url = parts[1];
+				if (!url) {
+					ctx.ui.notify("Usage: /a2a discover <agent-url>", "warning");
+					return;
+				}
+				try {
+					ctx.ui.notify(`Discovering A2A agent at ${url}...`, "info");
+					const signal = AbortSignal.timeout(15_000);
+					const client = await createA2AClient(url, signal);
+					const card = await client.getAgentCard({ signal });
+					ctx.ui.notify(`Agent: ${card.name} (v${card.version ?? "?"})`, "info");
+					ctx.ui.notify(`Description: ${card.description ?? "(none)"}`, "info");
+					ctx.ui.notify(`Skills: ${card.skills?.map((s) => s.name).join(", ") ?? "(none)"}`, "info");
+					ctx.ui.notify(`Streaming: ${card.capabilities?.streaming ? "yes" : "no"}`, "info");
+				} catch (error: unknown) {
+					ctx.ui.notify(`Discovery failed: ${errorMessage(error)}`, "error");
+				}
+				return;
+			}
 
-      if (subcmd === "discover") {
-        const url = parts[1];
-        if (!url) {
-          ctx.ui.notify("Usage: /a2a discover <agent-url>", "warning");
-          return;
-        }
-        try {
-          ctx.ui.notify(`Discovering A2A agent at ${url}...`, "info");
-          const clientFactory = new ClientFactory();
-          const client = await clientFactory.createFromUrl(url);
-          const card = client.agentCard;
-          ctx.ui.notify(`Agent: ${card.name} (v${card.version ?? "?"})`, "info");
-          ctx.ui.notify(`Description: ${card.description ?? "(none)"}`, "info");
-          ctx.ui.notify(
-            `Skills: ${card.skills?.map((s) => s.name).join(", ") ?? "(none)"}`,
-            "info",
-          );
-          ctx.ui.notify(`Streaming: ${card.capabilities?.streaming ? "yes" : "no"}`, "info");
-        } catch (err: any) {
-          ctx.ui.notify(`Discovery failed: ${err?.message ?? String(err)}`, "error");
-        }
-        return;
-      }
+			// status (default)
+			if (serverState) {
+				ctx.ui.notify(`A2A server: RUNNING on http://localhost:${serverState.port}`, "info");
+				ctx.ui.notify(`Agent card: http://localhost:${serverState.port}${AGENT_CARD_PATH}`, "info");
+			} else {
+				ctx.ui.notify("A2A server: STOPPED. Use /a2a start [port] to start.", "info");
+			}
+			ctx.ui.notify("Registered tools: a2a_delegate, a2a_discover", "info");
+		},
+	});
 
-      // status (default)
-      if (serverState) {
-        ctx.ui.notify(`A2A server: RUNNING on http://localhost:${serverState.port}`, "info");
-        ctx.ui.notify(`Agent card: http://localhost:${serverState.port}${AGENT_CARD_PATH}`, "info");
-      } else {
-        ctx.ui.notify("A2A server: STOPPED. Use /a2a start [port] to start.", "info");
-      }
-      ctx.ui.notify("Registered tools: a2a_delegate, a2a_discover", "info");
-    },
-  });
+	// ---- Lifecycle ----
+	pi.on("session_start", async (_event, ctx) => {
+		currentRuntime = ctx.model ? { model: ctx.model, modelRegistry: ctx.modelRegistry } : null;
+	});
 
-  // ---- Lifecycle ----
-  pi.on("session_shutdown", async () => {
-    if (serverState) {
-      await new Promise<void>((resolve) => {
-        serverState!.server.close(() => resolve());
-      });
-      serverState = null;
-    }
-  });
+	pi.on("model_select", async (event, ctx) => {
+		currentRuntime = { model: event.model, modelRegistry: ctx.modelRegistry };
+	});
+
+	pi.on("session_shutdown", async () => {
+		if (serverState) {
+			await new Promise<void>((resolve) => {
+				serverState!.server.close(() => resolve());
+			});
+			serverState = null;
+		}
+		currentRuntime = null;
+	});
 }
 
 // ---------------------------------------------------------------------------
 // Server startup
 // ---------------------------------------------------------------------------
 
-function startServer(getModel: () => any, port: number): A2AServerState {
-  const agentCard = createPiAgentCard(port);
-  const taskStore = new InMemoryTaskStore();
-  const executor = new PiA2AExecutor(getModel);
-  const requestHandler = new DefaultRequestHandler(agentCard, taskStore, executor);
+async function startServer(getModel: () => A2ARuntime | null, port: number): Promise<A2AServerState> {
+	const agentCard = createPiAgentCard(port);
+	const taskStore = new InMemoryTaskStore();
+	const executor = new PiA2AExecutor(getModel);
+	const requestHandler = new DefaultRequestHandler(agentCard, taskStore, executor);
 
-  const app = express();
-  app.use(express.json({ limit: "10mb" }));
-  app.use(`/${AGENT_CARD_PATH.replace(/^\//, "")}`, agentCardHandler({ agentCardProvider: requestHandler }));
-  app.use(jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
+	const app = express();
+	app.use(express.json({ limit: "10mb" }));
+	app.use(`/${AGENT_CARD_PATH.replace(/^\//, "")}`, agentCardHandler({ agentCardProvider: requestHandler }));
+	app.use(jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
 
-  const server = app.listen(port);
+	const server = app.listen(port, "127.0.0.1");
+	await new Promise<void>((resolve, reject) => {
+		server.once("listening", resolve);
+		server.once("error", reject);
+	});
 
-  return { app, server, port };
+	return { app, server, port };
 }

@@ -1,239 +1,182 @@
-/**
- * Self-contained A2A roundtrip test.
- *
- * Spins up the pi A2A server with a mock model, then uses the A2A client SDK
- * to discover the agent card, send a task via streaming, and verify the response.
- *
- * Run with: node --experimental-strip-types scripts/test-a2a.mjs
- */
-
-import express from "express";
+/** End-to-end test for the real A2A extension entrypoint. */
 import { randomUUID } from "node:crypto";
-import {
-  A2A_PROTOCOL_VERSION,
-  AGENT_CARD_PATH,
-  Role,
-  TaskState,
-} from "@a2a-js/sdk";
-import {
-  InMemoryTaskStore,
-  DefaultRequestHandler,
-  AgentEvent,
-} from "@a2a-js/sdk/server";
-import { agentCardHandler, jsonRpcHandler, UserBuilder } from "@a2a-js/sdk/server/express";
 import { ClientFactory } from "@a2a-js/sdk/client";
+import { Role } from "@a2a-js/sdk";
+import a2aExtension from "../index.ts";
 
-// ---- Mock model: echoes back the prompt ----
-function createMockModel() {
-  return {
-    async complete({ messages, systemPrompt }) {
-      const lastUser = messages
-        .filter((m) => m.role === "user")
-        .pop();
-      const text = lastUser?.content?.filter((c) => c.type === "text").map((c) => c.text).join("\n") ?? "";
-      return {
-        content: [
-          { type: "text", text: `[mock-pi] I received your message: "${text.slice(0, 100)}". System prompt length: ${systemPrompt?.length ?? 0}` },
-        ],
-      };
-    },
-  };
-}
+const tools = new Map();
+const commands = new Map();
+const handlers = new Map();
+const notifications = [];
+const pi = {
+  registerTool(tool) { tools.set(tool.name, tool); },
+  registerCommand(name, command) { commands.set(name, command); },
+  on(event, handler) {
+    const list = handlers.get(event) ?? [];
+    list.push(handler);
+    handlers.set(event, list);
+  },
+};
 
-// ---- Inline executor logic (mirrors PiA2AExecutor but simplified for test) ----
-function textPart(text) {
-  return {
-    content: { $case: "text", value: text },
-    filename: "",
-    mediaType: "text/plain",
-    metadata: undefined,
-  };
-}
+a2aExtension(pi);
 
-function extractTextFromMessage(message) {
-  const parts = [];
-  for (const part of message.parts) {
-    if (part.content?.$case === "text") parts.push(part.content.value);
-  }
-  return parts.join("\n\n").trim() || "(empty)";
-}
-
-class TestExecutor {
-  constructor(model) { this.model = model; this.cancelled = new Set(); }
-  cancelTask = async (taskId) => { this.cancelled.add(taskId); };
-
-  async execute(ctx, bus) {
-    const userMsg = ctx.userMessage;
-    const taskId = ctx.taskId;
-    const contextId = ctx.contextId;
-
-    try {
-      // 1. Initial task snapshot
-      bus.publish(AgentEvent.task({
-        id: taskId,
-        contextId,
-        status: { state: TaskState.TASK_STATE_SUBMITTED, timestamp: new Date().toISOString() },
-        artifacts: [],
-        history: [userMsg],
-        metadata: userMsg.metadata,
-      }));
-
-      // 2. Working status
-      bus.publish(AgentEvent.statusUpdate({
-        taskId, contextId,
-        status: {
-          state: TaskState.TASK_STATE_WORKING,
-          message: {
-            role: Role.ROLE_AGENT, messageId: randomUUID(), contextId, taskId,
-            parts: [textPart("Working on it...")],
-            metadata: {}, extensions: [], referenceTaskIds: [],
-          },
-          timestamp: new Date().toISOString(),
-        },
-        metadata: {},
-      }));
-
-      // 3. Call model
-      const userText = extractTextFromMessage(userMsg);
-      const result = await this.model.complete({
-        systemPrompt: "You are a test agent.",
-        messages: [{ role: "user", content: [{ type: "text", text: userText }] }],
-      });
-      const respText = result.content?.filter(c => c.type === "text").map(c => c.text).join("\n") ?? "";
-
-      // 4. Artifact
-      bus.publish(AgentEvent.artifactUpdate({
-        taskId, contextId,
-        artifact: {
-          artifactId: randomUUID(),
-          name: "Result",
-          description: "",
-          parts: [textPart(respText)],
-          extensions: [],
-        },
-        lastChunk: true,
-        append: false,
-      }));
-
-      // 5. Completed
-      bus.publish(AgentEvent.statusUpdate({
-        taskId, contextId,
-        status: { state: TaskState.TASK_STATE_COMPLETED, timestamp: new Date().toISOString() },
-        metadata: {},
-      }));
-    } finally {
-      this.cancelled.delete(taskId);
-    }
-  }
-}
-
-function startTestServer(port, model) {
-  const card = {
-    name: "pi Test Agent",
-    description: "Test instance of pi A2A server",
-    supportedInterfaces: [{ url: `http://localhost:${port}/`, protocolBinding: "JSONRPC", tenant: "", protocolVersion: A2A_PROTOCOL_VERSION }],
-    provider: { organization: "test" },
-    version: "test",
-    capabilities: { streaming: true, pushNotifications: false, extensions: [], extendedAgentCard: false },
-    securitySchemes: {}, securityRequirements: [],
-    defaultInputModes: ["text"], defaultOutputModes: ["text", "task-status"],
-    skills: [{ id: "test", name: "Test", description: "echo", tags: [], examples: [], inputModes: ["text"], outputModes: ["text"], securityRequirements: [] }],
-    signatures: [],
-  };
-  const store = new InMemoryTaskStore();
-  const executor = new TestExecutor(model);
-  const handler = new DefaultRequestHandler(card, store, executor);
-
-  const app = express();
-  app.use(express.json({ limit: "10mb" }));
-  const cardPath = AGENT_CARD_PATH.replace(/^\//, "");
-  app.use(`/${cardPath}`, agentCardHandler({ agentCardProvider: handler }));
-  app.use(jsonRpcHandler({ requestHandler: handler, userBuilder: UserBuilder.noAuthentication }));
-
-  const server = app.listen(port);
-  return { server, port, url: `http://localhost:${port}` };
-}
-
-// ---- Run tests ----
 let passed = 0;
-let failed = 0;
-function assert(cond, msg) {
-  if (cond) { console.log(`  ✓ ${msg}`); passed++; }
-  else { console.log(`  ✗ ${msg}`); failed++; }
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+  passed++;
+  console.log(`  ✓ ${message}`);
+}
+
+function textPart(text) {
+  return { content: { $case: "text", value: text }, filename: "", mediaType: "text/plain", metadata: undefined };
 }
 
 async function main() {
   const port = 41299;
-  console.log(`Starting test A2A server on port ${port}...`);
-  const model = createMockModel();
-  const { server, url } = startTestServer(port, model);
+  const model = { provider: "faux", id: "a2a-test" };
+  const modelRegistry = {
+    stream(_model, context, options) {
+      const text = context.messages.at(-1)?.content?.find((part) => part.type === "text")?.text ?? "";
+      const response = `[mock-pi] ${text}`;
+      return {
+        async *[Symbol.asyncIterator]() {
+          if (text === "Slow task") {
+            await new Promise((resolve, reject) => {
+              options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+            });
+          }
+          if (text === "Fail task") {
+            yield {
+              type: "error",
+              reason: "error",
+              error: {
+                role: "assistant",
+                content: [],
+                stopReason: "error",
+                errorMessage: "forced model failure",
+                timestamp: Date.now(),
+              },
+            };
+            return;
+          }
+          const split = Math.ceil(response.length / 2);
+          yield { type: "text_delta", contentIndex: 0, delta: response.slice(0, split), partial: undefined };
+          yield { type: "text_delta", contentIndex: 0, delta: response.slice(split), partial: undefined };
+          yield {
+            type: "done",
+            reason: "stop",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: response }],
+              stopReason: "stop",
+              timestamp: Date.now(),
+            },
+          };
+        },
+      };
+    },
+  };
+  const ctx = {
+    model,
+    modelRegistry,
+    ui: {
+      notify(message) { notifications.push(message); },
+    },
+  };
 
-  // Wait for server to be ready
-  await new Promise((r) => server.once("listening", r));
-
-  try {
-    console.log("\n[Test 1] Agent card discovery");
-    const factory = new ClientFactory();
-    const client = await factory.createFromUrl(url);
-    assert(client.agentCard.name === "pi Test Agent", `Card name is "${client.agentCard.name}"`);
-    assert(client.agentCard.capabilities.streaming === true, "Card advertises streaming");
-    assert(client.agentCard.skills.length === 1, `Card has ${client.agentCard.skills.length} skill(s)`);
-
-    console.log("\n[Test 2] Send message (streaming)");
-    const userMessage = {
-      role: Role.ROLE_USER, messageId: randomUUID(),
-      contextId: "", taskId: "",
-      parts: [textPart("Hello, pi! Tell me a short joke about programming.")],
-      metadata: {}, extensions: [], referenceTaskIds: [],
-    };
-
-    const events = [];
-    let finalText = "";
-    const stream = client.sendMessageStream({ message: userMessage });
-    for await (const resp of stream) {
-      const kind = resp.payload?.$case;
-      events.push(kind);
-      if (kind === "artifactUpdate") {
-        for (const p of resp.payload.value.artifact.parts) {
-          if (p.content?.$case === "text") finalText += p.content.value;
-        }
-      }
-    }
-
-    assert(events.includes("task"), "Stream includes 'task' event");
-    assert(events.includes("statusUpdate"), "Stream includes 'statusUpdate' event");
-    assert(events.includes("artifactUpdate"), "Stream includes 'artifactUpdate' event");
-    assert(finalText.includes("mock-pi"), `Result mentions mock-pi: "${finalText.slice(0, 80)}..."`);
-    assert(finalText.includes("Hello, pi!"), "Result echoes user input");
-
-    console.log("\n[Test 3] Send message (non-streaming fallback)");
-    const userMessage2 = {
-      role: Role.ROLE_USER, messageId: randomUUID(),
-      contextId: "", taskId: "",
-      parts: [textPart("What is 2+2?")],
-      metadata: {}, extensions: [], referenceTaskIds: [],
-    };
-    const result2 = await client.sendMessage({ message: userMessage2 });
-    let text2 = "";
-    if (result2.artifacts) {
-      for (const art of result2.artifacts) {
-        for (const p of art.parts) {
-          if (p.content?.$case === "text") text2 += p.content.value;
-        }
-      }
-    }
-    assert(text2.includes("mock-pi"), `Non-streaming result works: "${text2.slice(0, 80)}..."`);
-
-    console.log(`\n${"=".repeat(50)}`);
-    console.log(`Results: ${passed} passed, ${failed} failed`);
-  } catch (err) {
-    console.error("TEST ERROR:", err);
-    failed++;
-  } finally {
-    server.close();
+  for (const handler of handlers.get("session_start") ?? []) {
+    await handler({ type: "session_start", reason: "startup" }, ctx);
   }
 
-  process.exit(failed > 0 ? 1 : 0);
+  const command = commands.get("a2a");
+  assert(command, "real extension registered /a2a command");
+  assert(tools.has("a2a_delegate") && tools.has("a2a_discover"), "real extension registered client tools");
+  await command.handler(`start ${port}`, ctx);
+
+  try {
+    const url = `http://127.0.0.1:${port}`;
+    const client = await new ClientFactory().createFromUrl(url);
+    const card = await client.getAgentCard();
+    assert(card.name === "pi Coding Agent", "agent card is served by the real extension");
+    assert(!card.description.includes("run bash"), "agent card does not claim unavailable shell or filesystem access");
+
+    const message = {
+      role: Role.ROLE_USER,
+      messageId: randomUUID(),
+      contextId: "",
+      taskId: "",
+      parts: [textPart("Hello through A2A")],
+      metadata: {},
+      extensions: [],
+      referenceTaskIds: [],
+    };
+    const events = [];
+    let finalText = "";
+    for await (const response of client.sendMessageStream({
+      tenant: "",
+      message,
+      configuration: undefined,
+      metadata: undefined,
+    })) {
+      const payload = response.payload;
+      if (!payload) continue;
+      events.push(payload.$case);
+      if (payload.$case === "artifactUpdate") {
+        for (const part of payload.value.artifact?.parts ?? []) {
+          if (part.content?.$case === "text") finalText += part.content.value;
+        }
+      }
+    }
+    assert(events.includes("task"), "stream contains a task snapshot");
+    assert(events.includes("statusUpdate"), "stream contains status updates");
+    assert(events.includes("artifactUpdate"), "stream contains an artifact");
+    assert(events.filter((event) => event === "artifactUpdate").length >= 2, "model deltas are exposed as A2A artifact chunks");
+    assert(finalText === "[mock-pi] Hello through A2A", "inbound task used pi's current model registry");
+
+    const failedStates = [];
+    for await (const response of client.sendMessageStream({
+      tenant: "",
+      message: { ...message, messageId: randomUUID(), parts: [textPart("Fail task")] },
+      configuration: undefined,
+      metadata: undefined,
+    })) {
+      if (response.payload?.$case === "statusUpdate") failedStates.push(response.payload.value.status.state);
+    }
+    assert(failedStates.at(-1) === 4, "model failures terminate the A2A task as FAILED");
+
+    const cancelStream = client.sendMessageStream({
+      tenant: "",
+      message: { ...message, messageId: randomUUID(), parts: [textPart("Slow task")] },
+      configuration: undefined,
+      metadata: undefined,
+    });
+    const cancelStates = [];
+    let cancellationRequested = false;
+    for await (const response of cancelStream) {
+      if (response.payload?.$case === "task" && !cancellationRequested) {
+        cancellationRequested = true;
+        await client.cancelTask({ tenant: "", id: response.payload.value.id, metadata: undefined });
+      }
+      if (response.payload?.$case === "statusUpdate") cancelStates.push(response.payload.value.status.state);
+    }
+    assert(cancelStates.at(-1) === 5, "A2A cancellation aborts model execution and terminates as CANCELED");
+
+    const discover = await tools.get("a2a_discover").execute("discover", { agent_url: url });
+    assert(discover.content[0].text.includes("pi Coding Agent"), "a2a_discover uses the real client adapter");
+
+    const delegated = await tools.get("a2a_delegate").execute("delegate", {
+      agent_url: url,
+      task: "Delegated task",
+    });
+    assert(delegated.content[0].text.includes("[mock-pi] Delegated task"), "a2a_delegate completes a real round trip");
+  } finally {
+    await command.handler("stop", ctx);
+  }
+
+  console.log(`\nResults: ${passed} passed, 0 failed`);
 }
 
-main();
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

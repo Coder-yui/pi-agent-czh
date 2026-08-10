@@ -51,14 +51,14 @@ interface AuditEntry {
 	ts: string;
 	command: string;
 	cwd: string;
-	mode: "blocked-lethal" | "sandboxed" | "local" | "error";
+	mode: "blocked-lethal" | "sandboxed" | "audit-only" | "local" | "error";
 	reason?: string;
 	exitCode?: number | null;
 	durationMs?: number;
 	violations?: string[];
 }
 
-type SandboxMode = "off" | "audit-only" | "on";
+type SandboxMode = "off" | "audit-only" | "on" | "unavailable";
 
 // ---------------------------------------------------------------------------
 // Lethal command patterns (blocked BEFORE entering the sandbox)
@@ -76,22 +76,43 @@ interface LethalPattern {
 
 const LETHAL_PATTERNS: LethalPattern[] = [
 	// Recursive removal of root or home (supports -rf, -r -f, --recursive --force etc.)
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?rm\s+(?:(?:--recursive|--force|-[a-zA-Z]*[rRf][a-zA-Z]*)\s+)*(?:--no-preserve-root\s+)?\/\s*(?:$|;|&|\||#)/, reason: "refusing to 'rm -rf /' (would destroy the system)" },
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?rm\s+(?:(?:--recursive|--force|-[a-zA-Z]*[rRf][a-zA-Z]*)\s+)+~\/?\s*(?:$|;|&|\||#)/, reason: "refusing to recursively delete home directory" },
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?rm\s+(?:(?:--recursive|--force|-[a-zA-Z]*[rRf][a-zA-Z]*)\s+)*(?:--no-preserve-root\s+)?\/\s*(?:$|;|&|\||#)/,
+		reason: "refusing to 'rm -rf /' (would destroy the system)",
+	},
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?rm\s+(?:(?:--recursive|--force|-[a-zA-Z]*[rRf][a-zA-Z]*)\s+)+~\/?\s*(?:$|;|&|\||#)/,
+		reason: "refusing to recursively delete home directory",
+	},
 	// Format disks / write to block devices
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?(?:mkfs|fdisk|parted)\b/, reason: "refusing to run disk-formatting/partitioning tools" },
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?dd\b[^&|;]*\bof=\/dev\/(?:sd|hd|nvme|disk|mem|kmem)\w+/, reason: "refusing 'dd' to a block/kmem device (would overwrite disk/memory)" },
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?(?:mkfs|fdisk|parted)\b/,
+		reason: "refusing to run disk-formatting/partitioning tools",
+	},
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?dd\b[^&|;]*\bof=\/dev\/(?:sd|hd|nvme|disk|mem|kmem)\w+/,
+		reason: "refusing 'dd' to a block/kmem device (would overwrite disk/memory)",
+	},
 	// Fork bomb — classic bash fork bomb (must match against full command, not segments).
 	{ re: /:\s*\(\s*\)\s*\{[^}]*:\|:\s*&[^}]*\}\s*;/, reason: "refusing to execute a fork bomb", matchFull: true },
 	{ re: /\bfork\s*bomb\b/i, reason: "refusing fork bomb invocation", matchFull: true },
 	// Shutdown / reboot / init 0/6 (must be the command, not an argument to grep/echo/etc.)
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?(?:shutdown|reboot|halt|poweroff|init\s+[06]|telinit\s+[06])\b/, reason: "refusing system shutdown/reboot commands" },
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?(?:shutdown|reboot|halt|poweroff|init\s+[06]|telinit\s+[06])\b/,
+		reason: "refusing system shutdown/reboot commands",
+	},
 	// chmod 777 on system dirs
-	{ re: /(?:^|[\s;|&])(?:sudo\s+)?chmod\s+(?:-R\s+)?777\s+(?:\/(?:etc|usr|bin|sbin|var|root|System|opt|boot)|~)/, reason: "refusing chmod 777 on system directories" },
+	{
+		re: /(?:^|[\s;|&])(?:sudo\s+)?chmod\s+(?:-R\s+)?777\s+(?:\/(?:etc|usr|bin|sbin|var|root|System|opt|boot)|~)/,
+		reason: "refusing chmod 777 on system directories",
+	},
 	// Write directly to disk devices via redirect
 	{ re: />\s*\/dev\/(?:sd|hd|nvme|disk|mem|kmem)\w+/, reason: "refusing redirect to a block/kmem device" },
 	// curl | sh / wget | sh style remote code execution
-	{ re: /\|\s*(?:sudo\s+)?(?:ba)?sh\b/, reason: "refusing pipe-to-shell remote code execution (download the script first and inspect it)" },
+	{
+		re: /\|\s*(?:sudo\s+)?(?:ba)?sh\b/,
+		reason: "refusing pipe-to-shell remote code execution (download the script first and inspect it)",
+	},
 	// Cryptomining / known malware-ish commands
 	{ re: /(?:^|[\s;|&])(?:xmrig|minerd|cpuminer|ccminer|ethminer)\b/, reason: "refusing known cryptominer binaries" },
 ];
@@ -142,10 +163,14 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 	if (overrides.network) result.network = { ...base.network, ...overrides.network };
 	if (overrides.filesystem) result.filesystem = { ...base.filesystem, ...overrides.filesystem };
 
-	const extOverrides = overrides as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
+	const extOverrides = overrides as {
+		ignoreViolations?: Record<string, string[]>;
+		enableWeakerNestedSandbox?: boolean;
+	};
 	const extResult = result as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
 	if (extOverrides.ignoreViolations) extResult.ignoreViolations = extOverrides.ignoreViolations;
-	if (extOverrides.enableWeakerNestedSandbox !== undefined) extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
+	if (extOverrides.enableWeakerNestedSandbox !== undefined)
+		extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
 	return result;
 }
 
@@ -155,10 +180,18 @@ function loadConfig(cwd: string): SandboxConfig {
 	let globalConfig: Partial<SandboxConfig> = {};
 	let projectConfig: Partial<SandboxConfig> = {};
 	if (existsSync(globalConfigPath)) {
-		try { globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8")); } catch (e) { console.error(`[sandbox] bad global config: ${e}`); }
+		try {
+			globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
+		} catch (e) {
+			console.error(`[sandbox] bad global config: ${e}`);
+		}
 	}
 	if (existsSync(projectConfigPath)) {
-		try { projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8")); } catch (e) { console.error(`[sandbox] bad project config: ${e}`); }
+		try {
+			projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
+		} catch (e) {
+			console.error(`[sandbox] bad project config: ${e}`);
+		}
 	}
 	return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
 }
@@ -169,13 +202,17 @@ function loadConfig(cwd: string): SandboxConfig {
 
 function getAuditPath(): string {
 	const dir = getAgentDir();
-	try { mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+	try {
+		mkdirSync(dir, { recursive: true });
+	} catch {
+		/* ignore */
+	}
 	return join(dir, "sandbox-audit.jsonl");
 }
 
 function appendAudit(entry: AuditEntry) {
 	try {
-		const line = JSON.stringify(entry) + "\n";
+		const line = `${JSON.stringify(entry)}\n`;
 		appendFileSync(getAuditPath(), line);
 	} catch {
 		// Audit failures must not break execution.
@@ -243,14 +280,29 @@ function createSandboxedBashOps(): BashOperations {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
 						if (child.pid) {
-							try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+							try {
+								process.kill(-child.pid, "SIGKILL");
+							} catch {
+								child.kill("SIGKILL");
+							}
 						}
 					}, timeout * 1000);
 				}
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
-				child.on("error", (err) => { if (timeoutHandle) clearTimeout(timeoutHandle); reject(err); });
-				const onAbort = () => { if (child.pid) { try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } } };
+				child.on("error", (err) => {
+					if (timeoutHandle) clearTimeout(timeoutHandle);
+					reject(err);
+				});
+				const onAbort = () => {
+					if (child.pid) {
+						try {
+							process.kill(-child.pid, "SIGKILL");
+						} catch {
+							child.kill("SIGKILL");
+						}
+					}
+				};
 				signal?.addEventListener("abort", onAbort, { once: true });
 				child.on("close", (code) => {
 					if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -286,7 +338,9 @@ export default function (pi: ExtensionAPI) {
 		...localBash,
 		name: "bash",
 		label: "bash (sandboxed)",
-		description: localBash.description + " Commands are filtered for obviously dangerous patterns and executed inside an OS-level sandbox (filesystem + network restrictions) when enabled.",
+		description:
+			localBash.description +
+			" Commands are filtered for obviously dangerous patterns and executed inside an OS-level sandbox (filesystem + network restrictions) when enabled.",
 		async execute(id, params, signal, onUpdate, ctx) {
 			const { command } = params as { command: string; timeout?: number };
 			const startedAt = Date.now();
@@ -295,7 +349,7 @@ export default function (pi: ExtensionAPI) {
 			if (currentConfig.blockLethal !== false) {
 				const lethal = checkLethal(command);
 				if (lethal.blocked) {
-					const msg = `[SANDBOX BLOCKED] ${lethal.reason}\n\nCommand rejected: ${command}\n\n(This was blocked by the sandbox extension before execution. If you are certain this is safe, disable the sandbox with --no-sandbox and re-run.)`;
+					const msg = `[SANDBOX BLOCKED] ${lethal.reason}\n\nCommand rejected: ${command}\n\nThis command is blocked by the always-on lethal filter. To allow it, explicitly set blockLethal=false in the sandbox configuration.`;
 					appendAudit({
 						ts: new Date().toISOString(),
 						command,
@@ -306,6 +360,18 @@ export default function (pi: ExtensionAPI) {
 					if (onUpdate) onUpdate({ content: [{ type: "text", text: msg }], details: undefined });
 					throw new Error(msg);
 				}
+			}
+			if (sandboxMode === "unavailable") {
+				const message =
+					"[SANDBOX UNAVAILABLE] Isolation was explicitly required, but the OS sandbox failed to initialize.";
+				appendAudit({
+					ts: new Date().toISOString(),
+					command,
+					cwd: ctx.cwd,
+					mode: "error",
+					reason: message,
+				});
+				throw new Error(message);
 			}
 
 			// Pick the execution backend.
@@ -331,54 +397,142 @@ export default function (pi: ExtensionAPI) {
 					durationMs: Date.now() - startedAt,
 				});
 				return result;
-			} catch (err: any) {
+			} catch (error: unknown) {
 				// Non-zero exit codes come through as thrown errors from createBashTool.
-				const exitMatch = /exited with code (\d+)/.exec(err?.message ?? "");
+				const message = error instanceof Error ? error.message : String(error);
+				const exitMatch = /exited with code (\d+)/.exec(message);
 				appendAudit({
 					ts: new Date().toISOString(),
 					command,
 					cwd: ctx.cwd,
-					mode: err?.message?.includes("[SANDBOX BLOCKED]") ? "blocked-lethal" : "error",
+					mode: message.includes("[SANDBOX BLOCKED]") ? "blocked-lethal" : "error",
 					exitCode: exitMatch ? Number(exitMatch[1]) : null,
 					durationMs: Date.now() - startedAt,
-					reason: err?.message?.slice(0, 200),
+					reason: message.slice(0, 200),
 				});
-				throw err;
+				throw error;
 			}
 		},
 	});
 
-	// Also intercept user_bash event so direct CLI bash runs through sandbox.
-	pi.on("user_bash", () => {
-		if (sandboxMode === "on" && sandboxInitialized) {
-			return { operations: createSandboxedBashOps() };
+	// Also intercept direct !/!! commands. This path needs its own lethal check
+	// and audit wrapper because it does not execute through the overridden tool.
+	pi.on("user_bash", (event) => {
+		if (currentConfig.blockLethal !== false) {
+			const lethal = checkLethal(event.command);
+			if (lethal.blocked) {
+				const output = `[SANDBOX BLOCKED] ${lethal.reason}\nCommand rejected: ${event.command}\n`;
+				appendAudit({
+					ts: new Date().toISOString(),
+					command: event.command,
+					cwd: event.cwd,
+					mode: "blocked-lethal",
+					reason: lethal.reason,
+					exitCode: 126,
+				});
+				return { result: { output, exitCode: 126, cancelled: false, truncated: false } };
+			}
 		}
-		return;
+		if (sandboxMode === "unavailable") {
+			const output = "[SANDBOX UNAVAILABLE] Isolation is required but unavailable; command refused.\n";
+			appendAudit({
+				ts: new Date().toISOString(),
+				command: event.command,
+				cwd: event.cwd,
+				mode: "error",
+				reason: output.trim(),
+				exitCode: 125,
+			});
+			return { result: { output, exitCode: 125, cancelled: false, truncated: false } };
+		}
+
+		const mode: AuditEntry["mode"] =
+			sandboxMode === "on" && sandboxInitialized ? "sandboxed" : sandboxMode === "off" ? "local" : "audit-only";
+		const base = mode === "sandboxed" ? createSandboxedBashOps() : localOps;
+		const operations: BashOperations = {
+			async exec(command, cwd, options) {
+				const startedAt = Date.now();
+				try {
+					const result = await base.exec(command, cwd, options);
+					appendAudit({
+						ts: new Date().toISOString(),
+						command,
+						cwd,
+						mode,
+						exitCode: result.exitCode,
+						durationMs: Date.now() - startedAt,
+					});
+					return result;
+				} catch (error) {
+					appendAudit({
+						ts: new Date().toISOString(),
+						command,
+						cwd,
+						mode: "error",
+						exitCode: null,
+						durationMs: Date.now() - startedAt,
+						reason: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+					});
+					throw error;
+				}
+			},
+		};
+		return { operations };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const noSandbox = pi.getFlag("no-sandbox") as boolean;
 		currentConfig = loadConfig(ctx.cwd);
+		const requestedMode = process.env.PI_SANDBOX_MODE;
+		if (requestedMode && !["on", "audit-only", "off"].includes(requestedMode)) {
+			ctx.ui.notify(`Ignoring invalid PI_SANDBOX_MODE=${requestedMode}; expected on, audit-only, or off`, "warning");
+		}
+		const configuredMode =
+			requestedMode === "on" || requestedMode === "audit-only" || requestedMode === "off"
+				? requestedMode
+				: undefined;
 
-		if (noSandbox || !currentConfig.enabled) {
-			sandboxMode = noSandbox ? "off" : "audit-only";
+		if (noSandbox || configuredMode === "off" || configuredMode === "audit-only" || !currentConfig.enabled) {
+			sandboxMode = noSandbox || configuredMode === "off" ? "off" : "audit-only";
 			sandboxInitialized = false;
-			ctx.ui.notify(noSandbox ? "Sandbox: disabled (--no-sandbox); lethal filter + audit still active" : "Sandbox: audit-only mode (config.enabled=false)", "warning");
-			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("warning", noSandbox ? "🔓 Sandbox: OFF" : "📝 Sandbox: audit-only"));
+			ctx.ui.notify(
+				sandboxMode === "off"
+					? "Sandbox: disabled (--no-sandbox); lethal filter + audit still active"
+					: "Sandbox: audit-only mode (explicit mode or config.enabled=false)",
+				"warning",
+			);
+			ctx.ui.setStatus(
+				"sandbox",
+				ctx.ui.theme.fg("warning", noSandbox ? "🔓 Sandbox: OFF" : "📝 Sandbox: audit-only"),
+			);
 			return;
 		}
 
 		const platform = process.platform;
 		if (platform !== "darwin" && platform !== "linux") {
-			sandboxMode = "audit-only";
+			sandboxMode = configuredMode === "on" ? "unavailable" : "audit-only";
 			sandboxInitialized = false;
-			ctx.ui.notify(`Sandbox: OS-level sandbox not supported on ${platform}; audit-only mode`, "warning");
-			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("warning", "📝 Sandbox: audit-only"));
+			ctx.ui.notify(
+				configuredMode === "on"
+					? `Sandbox: OS-level sandbox not supported on ${platform}; commands will be refused`
+					: `Sandbox: OS-level sandbox not supported on ${platform}; audit-only mode`,
+				"warning",
+			);
+			ctx.ui.setStatus(
+				"sandbox",
+				ctx.ui.theme.fg(
+					"warning",
+					sandboxMode === "unavailable" ? "Sandbox: unavailable (fail-closed)" : "Sandbox: audit-only",
+				),
+			);
 			return;
 		}
 
 		try {
-			const configExt = currentConfig as unknown as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
+			const configExt = currentConfig as unknown as {
+				ignoreViolations?: Record<string, string[]>;
+				enableWeakerNestedSandbox?: boolean;
+			};
 			await SandboxManager.initialize({
 				network: currentConfig.network,
 				filesystem: currentConfig.filesystem,
@@ -390,19 +544,40 @@ export default function (pi: ExtensionAPI) {
 
 			const netCount = currentConfig.network?.allowedDomains?.length ?? 0;
 			const writeCount = currentConfig.filesystem?.allowWrite?.length ?? 0;
-			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `🔒 Sandbox: ${netCount} domains, ${writeCount} write paths`));
-			ctx.ui.notify(`Sandbox: active (${netCount} allowed domains, ${writeCount} write paths, lethal filter on)`, "info");
-		} catch (err) {
-			sandboxMode = "audit-only";
+			ctx.ui.setStatus(
+				"sandbox",
+				ctx.ui.theme.fg("accent", `🔒 Sandbox: ${netCount} domains, ${writeCount} write paths`),
+			);
+			ctx.ui.notify(
+				`Sandbox: active (${netCount} allowed domains, ${writeCount} write paths, lethal filter on)`,
+				"info",
+			);
+		} catch (error: unknown) {
+			sandboxMode = configuredMode === "on" ? "unavailable" : "audit-only";
 			sandboxInitialized = false;
-			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}; falling back to audit-only mode`, "error");
-			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("warning", "📝 Sandbox: audit-only"));
+			ctx.ui.notify(
+				configuredMode === "on"
+					? `Sandbox initialization failed: ${error instanceof Error ? error.message : error}; commands will be refused because PI_SANDBOX_MODE=on`
+					: `Sandbox initialization failed: ${error instanceof Error ? error.message : error}; falling back to audit-only mode`,
+				"error",
+			);
+			ctx.ui.setStatus(
+				"sandbox",
+				ctx.ui.theme.fg(
+					"warning",
+					sandboxMode === "unavailable" ? "Sandbox: unavailable (fail-closed)" : "Sandbox: audit-only",
+				),
+			);
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
 		if (sandboxInitialized) {
-			try { await SandboxManager.reset(); } catch { /* ignore cleanup errors */ }
+			try {
+				await SandboxManager.reset();
+			} catch {
+				/* ignore cleanup errors */
+			}
 			sandboxInitialized = false;
 		}
 	});
@@ -420,12 +595,22 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "log") {
 				const n = Math.max(1, Math.min(100, parseInt(parts[1] ?? "10", 10) || 10));
 				const entries = readAuditTail(n);
-				if (entries.length === 0) { ctx.ui.notify("No audit entries yet.", "info"); return; }
+				if (entries.length === 0) {
+					ctx.ui.notify("No audit entries yet.", "info");
+					return;
+				}
 				const lines = entries.map((e) => {
-					const icon = e.mode === "blocked-lethal" ? "🚫" : e.mode === "sandboxed" ? "🔒" : e.mode === "audit-only" ? "📝" : "⚪";
+					const icon =
+						e.mode === "blocked-lethal"
+							? "🚫"
+							: e.mode === "sandboxed"
+								? "🔒"
+								: e.mode === "audit-only"
+									? "📝"
+									: "⚪";
 					const dur = e.durationMs != null ? ` (${e.durationMs}ms)` : "";
 					const ec = e.exitCode != null ? ` exit=${e.exitCode}` : "";
-					return `${icon} [${e.ts.slice(11, 19)}] ${e.mode}${dur}${ec}  ${e.command.length > 80 ? e.command.slice(0, 80) + "…" : e.command}`;
+					return `${icon} [${e.ts.slice(11, 19)}] ${e.mode}${dur}${ec}  ${e.command.length > 80 ? `${e.command.slice(0, 80)}…` : e.command}`;
 				});
 				ctx.ui.notify(`Last ${entries.length} sandbox audit entries:\n\n${lines.join("\n")}`, "info");
 				return;
@@ -439,7 +624,7 @@ export default function (pi: ExtensionAPI) {
 				const auditOk = existsSync(getAuditPath());
 				const lines = [
 					`Lethal filter: ${lethal.blocked ? "✅ working" : "❌ NOT working"} (rm -rf / → ${lethal.reason ?? "not blocked"})`,
-					`OS sandbox:    ${sandboxMode === "on" ? "✅ active" : sandboxMode === "audit-only" ? "⚠️ audit-only (no OS enforcement)" : "❌ off"}`,
+					`OS sandbox:    ${sandboxMode === "on" ? "✅ active" : sandboxMode === "audit-only" ? "⚠️ audit-only (no OS enforcement)" : sandboxMode === "unavailable" ? "❌ unavailable (fail-closed)" : "❌ off"}`,
 					`Audit log:     ${auditOk ? "✅" : "⚠️ (no entries yet)"} ${getAuditPath()}`,
 					`Platform:      ${process.platform}`,
 					"",
@@ -456,11 +641,18 @@ export default function (pi: ExtensionAPI) {
 			const fsAllowWrite = currentConfig.filesystem?.allowWrite?.length ?? 0;
 			const fsDenyWrite = currentConfig.filesystem?.denyWrite?.length ?? 0;
 			const modeLabel =
-				sandboxMode === "on" ? "🔒 OS sandbox active"
-				: sandboxMode === "audit-only" ? "📝 audit-only (commands logged, not sandboxed)"
-				: "🔓 off (no OS sandbox)";
+				sandboxMode === "on"
+					? "🔒 OS sandbox active"
+					: sandboxMode === "audit-only"
+						? "📝 audit-only (commands logged, not sandboxed)"
+						: sandboxMode === "unavailable"
+							? "❌ unavailable (commands refused)"
+							: "🔓 off (no OS sandbox)";
 			const recent = readAuditTail(3);
-			const recentStr = recent.length === 0 ? "(none yet)" : recent.map((e) => `  - ${e.mode}: ${e.command.slice(0, 70)}`).join("\n");
+			const recentStr =
+				recent.length === 0
+					? "(none yet)"
+					: recent.map((e) => `  - ${e.mode}: ${e.command.slice(0, 70)}`).join("\n");
 			const lines = [
 				`Sandbox status: ${modeLabel}`,
 				`Lethal filter: ${currentConfig.blockLethal !== false ? "✅ on" : "❌ off"}`,

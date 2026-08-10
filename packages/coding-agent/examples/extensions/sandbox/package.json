@@ -14,6 +14,7 @@
 		]
 	},
 	"dependencies": {
-		"@anthropic-ai/sandbox-runtime": "0.0.26"
+		"@anthropic-ai/sandbox-runtime": "0.0.26",
+		"@earendil-works/pi-coding-agent": "^0.84.0"
 	}
 }

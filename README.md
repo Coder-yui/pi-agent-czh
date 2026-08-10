@@ -1,3 +1,57 @@
+# pi-agent-czh — 基于 pi 的现代 Agent Harness
+
+`pi-agent-czh` 以 [pi](https://github.com/earendil-works/pi-mono) 的极简 AgentSession、工具系统和多模型运行时为基础，接入了现代 agent harness 常见的协议、工作流、安全、记忆、评测和多 Agent 能力。
+
+这个项目的目标不是重新实现成熟协议，而是使用官方 SDK 或成熟运行时完成适配，让这些能力能被 pi 的模型真实发现、调用、组合，并接受可重复的端到端验证。
+
+## 新增能力
+
+| 模块 | 已实现的能力 | 采用的成熟方案 |
+|---|---|---|
+| MCP Client | stdio/Streamable HTTP、工具/资源/提示词挂载、分页和动态刷新 | 官方 Model Context Protocol TypeScript SDK |
+| Memory | 长期知识图谱、相关记忆注入、跨进程 JSONL 持久化、顺序一致的状态型工具调用 | 官方 MCP Memory Server |
+| ACP | 编辑器协议握手、会话、权限桥接、工具与文本增量流、取消和关闭 | 官方 Agent Client Protocol SDK |
+| Sandbox | OS 级隔离、致命命令过滤、项目策略、审计和 fail-closed 模式 | Anthropic Sandbox Runtime |
+| Plan/Reflect | 自动规划提示、错误反思、重复失败检测和确定性重试阻断 | pi extension lifecycle hooks |
+| Evals | 隔离工作区、真实代码执行、judge 评分和多模型评测入口 | Vitest Evals |
+| A2A | Agent Card、JSON-RPC/流式任务、失败与取消、远程 Agent 委派 | Google A2A SDK/协议 |
+| Agent Economy | DID:key、Ed25519/JWS、Agent 发现、报价、确认式模拟支付和幂等账本 | `jose`、DID:key 与 AP2 风格流程 |
+| Agent Loop | 完整 AgentSession 多轮续跑、显式 checkpoint、暂停/恢复、迭代/工具/时间硬预算 | Google ADK LoopAgent 控制模式 |
+| Agent Graph | 校验后的图定义、条件路由、纠错循环、审批节点、取消和隔离 pi 节点 | 官方 LangGraph.js `StateGraph` |
+
+每个扩展的实现范围、命令、测试和明确边界记录在 [扩展实施文档](docs/phases/README.md)；Agent Loop 和 Agent Graph 还有各自的 [Loop README](packages/coding-agent/examples/extensions/agent-loop/README.md) 与 [Graph README](packages/coding-agent/examples/extensions/agent-graph/README.md)。
+
+## 验证状态
+
+仓库包含两层验证，避免把“注册了一个工具”误当成“能力已经接入”：
+
+- 确定性 E2E：11/11 组通过，覆盖官方 server/SDK、协议生命周期、安全边界、持久化、条件路由、循环上限和取消。
+- 真实模型 E2E：使用 `deepseek/deepseek-v4-pro` 完成 9/9 项集成测试；模型实际调用 MCP、Memory、Sandbox、Plan/Reflect、Economy，并通过 ACP/A2A、两轮 Agent Loop 和两节点 Agent Graph。
+- 真实编程 Eval：DeepSeek 在隔离目录编写 `sum.js`、调用工具并运行测试，judge 得分 `1.00`。
+- 工程检查：`npm run check` 和 `npm run build:offline` 通过。
+
+```bash
+# 无需模型凭据的全部确定性验证
+node docs/scripts/verify-all.mjs
+
+# 真实模型编程 eval（provider/model 可替换）
+PI_PROVIDER=deepseek PI_MODEL=deepseek-v4-pro node docs/scripts/verify-all.mjs 3
+
+# 真实模型驱动全部现代 Agent 接入
+npm run build:offline
+PI_PROVIDER=deepseek PI_MODEL=deepseek-v4-pro node docs/scripts/verify-live-model.mjs
+```
+
+DeepSeek 可以在 pi 中执行 `/login deepseek` 配置；凭据保存在 `~/.pi/agent/auth.json`，不写入仓库。
+
+## 与上游 pi 的关系
+
+本仓库保留 pi 原有 runtime、CLI、provider 和文档体系，新增能力主要位于 `packages/coding-agent/examples/extensions/` 与 `docs/phases/`。下面保留上游项目 README，便于继续查阅 pi 本身的构建、包结构和开发说明。
+
+---
+
+## 上游 pi README（保留）
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">

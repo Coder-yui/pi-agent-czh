@@ -3,11 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ACP (Agent Client Protocol) adapter for pi — bridges the official ACP stdio protocol to pi's built-in JSON-RPC mode, enabling Zed/OpenClaw/JetBrains and other ACP-compatible editors to drive pi as a coding agent.",
+	"description": "ACP adapter for pi — bridges the official ACP stdio protocol to an in-process pi AgentSession for compatible editors and clients.",
   "bin": {
     "pi-acp": "./dist/index.js"
   },
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "npm run clean && esbuild index.ts --bundle --platform=node --format=esm --packages=external --tsconfig=tsconfig.build.json --sourcemap --outfile=dist/index.js",
+		"test": "tsx scripts/e2e-test.ts"
+  },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.3.0"
-  }
+    "@agentclientprotocol/sdk": "1.3.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "zod": "4.4.3"
+  },
+	"devDependencies": {
+		"esbuild": "0.28.1",
+		"shx": "0.4.0",
+		"tsx": "4.23.10"
+	}
 }

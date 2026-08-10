@@ -25,8 +25,8 @@ A2A is an open protocol for communication between AI agents, designed to solve t
 
 ### Dependencies
 
-- **`@a2a-js/sdk@^1.0.1`** — Official TypeScript SDK from Google/Linux Foundation
-- **`express@^4.21.0`** — HTTP server for the A2A JSON-RPC endpoint
+- **`@a2a-js/sdk@1.0.1`** — Official TypeScript SDK from the A2A project
+- **`express@4.22.2`** — HTTP server for the A2A JSON-RPC endpoint
 
 ### Architecture
 
@@ -58,7 +58,7 @@ A2A is an open protocol for communication between AI agents, designed to solve t
 |------|---------|
 | `extensions/a2a/package.json` | Extension dependencies |
 | `extensions/a2a/index.ts` | Main extension: server + client tools + commands |
-| `extensions/a2a/scripts/test-a2a.mjs` | Self-contained E2E test (9 tests, all passing) |
+| `extensions/a2a/scripts/test-a2a.mjs` | Self-contained SDK-level E2E test |
 
 ### Server: `PiA2AExecutor`
 
@@ -68,12 +68,12 @@ The `PiA2AExecutor` class implements A2A's `AgentExecutor` interface:
    - Publishes an initial `task` snapshot (required by the SDK as the first event)
    - Publishes a `working` status update
    - Extracts text from the user message
-   - Calls pi's currently selected model (with streaming support when available)
-   - Publishes the response as a `result artifact`
-   - Publishes a `completed` status update
-   - Handles cancellation via `cancelTask()`
+   - Calls pi's currently selected model through the public ModelRegistry streaming facade
+   - Publishes model deltas as ordered chunks of one A2A artifact (`append`/`lastChunk` semantics preserved)
+	- Publishes a `completed` status update
+	- Publishes `failed` on model errors; `cancelTask()` aborts the real model stream and publishes `canceled`
 
-2. **Agent Card** — Describes pi as a coding agent with a `coding` skill, streaming support, and JSON-RPC transport.
+2. **Agent Card** — Advertises the actual direct-model text/coding-advice boundary and streaming JSON-RPC transport. It deliberately does not claim bash or filesystem access because inbound A2A tasks do not create a full AgentSession.
 
 ### Client: Registered Tools
 
@@ -87,7 +87,7 @@ Two tools are registered with pi's tool system and available to the LLM during a
   "context": "string (optional, additional context)"
 }
 ```
-Sends a task to a remote A2A agent using streaming JSON-RPC, collects status updates and artifacts, and returns the final result. Falls back to non-streaming if streaming fails.
+Sends a task to a remote A2A agent using streaming JSON-RPC, collects status updates and correctly appends artifact chunks. Caller cancellation and timeout are passed through the SDK. It falls back to non-streaming only when the stream failed before yielding any protocol payload, avoiding duplicate task execution after partial delivery.
 
 #### `a2a_discover`
 ```json
@@ -151,26 +151,7 @@ pi calls a2a_delegate(agent_url="http://localhost:42000", task="Calculate 42!")
 
 ## Test Results
 
-```
-Starting test A2A server on port 41299...
-
-[Test 1] Agent card discovery
-  ✓ Card name is "pi Test Agent"
-  ✓ Card advertises streaming
-  ✓ Card has 1 skill(s)
-
-[Test 2] Send message (streaming)
-  ✓ Stream includes 'task' event
-  ✓ Stream includes 'statusUpdate' event
-  ✓ Stream includes 'artifactUpdate' event
-  ✓ Result mentions mock-pi
-  ✓ Result echoes user input
-
-[Test 3] Send message (non-streaming fallback)
-  ✓ Non-streaming result works
-
-Results: 9 passed, 0 failed
-```
+The SDK-level test verifies Agent Card accuracy, multi-delta artifact chunks, failed model calls, real cancellation, discovery, and streaming/non-streaming round trips. The current suite has 13 passing assertions.
 
 Run tests:
 ```bash
@@ -183,7 +164,7 @@ node scripts/test-a2a.mjs
 ### Current v0.1 Limitations
 
 1. **No tool execution in A2A server mode**: When pi receives a task via A2A, it calls the model directly without spawning a full `AgentSession` (no bash, no file editing in A2A tasks). This ensures reliability for v0.1.
-2. **Model access**: The server relies on pi's session model being available. If no model is configured, it returns an error artifact.
+2. **Model access**: The server relies on pi's session model being available. Missing models and model errors terminate the A2A task in `failed`, rather than returning an error-shaped artifact followed by `completed`.
 3. **No authentication**: The server runs without auth (intended for local/dev use).
 4. **Single-tenant**: All tasks share the same server instance.
 

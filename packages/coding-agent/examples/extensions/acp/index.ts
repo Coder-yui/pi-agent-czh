@@ -16,7 +16,5 @@ const stdoutWeb = Writable.toWeb(process.stdout) as unknown as WritableStream<Ui
 const stdinWeb = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
 const stream = acp.ndJsonStream(stdoutWeb, stdinWeb);
 
-buildAgentApp().connect(stream);
-
-// Keep process alive; connection closes on stdin EOF.
-await new Promise(() => {});
+const connection = buildAgentApp().connect(stream);
+await connection.closed;
