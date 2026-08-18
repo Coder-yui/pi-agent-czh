@@ -27,24 +27,26 @@
 |---|---|
 | **配置加载** | ✅ 从 `~/.pi/mcp.json`（全局）+ `<cwd>/.pi/mcp.json`（项目级，覆盖全局）读取 `mcpServers` 配置 |
 | **Stdio transport** | ✅ 通过 `StdioClientTransport` 启动子进程，支持 `env` 环境变量注入（如 GitHub token） |
-| **Streamable HTTP transport** | ✅ 通过 `StreamableHTTPClientTransport` 连接远程 MCP server，支持自定义 `headers`（如 Bearer token） |
+| **2026-07-28 无状态协议** | ✅ 使用 `server/discover` 发现能力，无 `initialize` / `Mcp-Session-Id`；每个请求携带协议版本、client info 与 capabilities metadata；HTTP 自动附带 `MCP-Protocol-Version`、`Mcp-Method`、`Mcp-Name` 标头 |
+| **Streamable HTTP transport** | ✅ 通过 `StreamableHTTPClientTransport` 连接远程 MCP server，支持自定义 `headers`（如 Bearer token）；7.28 server 使用每请求 POST/SSE，不再依赖 GET stream 或协议 session |
 | **Tools 挂载** | ✅ 每个 MCP tool 以 `mcp__<server>__<tool>` 命名注册到 pi，JSON Schema → TypeBox 用 `Type.Unsafe` 透传 |
 | **Resources 挂载** | ✅ 合成一个 `mcp__<server>__read_resource` 工具，description 里列出静态 resources 与 resource templates，LLM 可按需读取 |
 | **Prompts 挂载** | ✅ 每个 MCP prompt 注册为 `/mcp-prompt-<server>-<name>` 斜杠命令，支持位置参数和 `key=value` 参数，执行后作为用户消息注入 |
-| **分页与 list_changed** | ✅ 沿 SDK 返回的 cursor 拉取 tools/prompts/resources/templates 全部分页；监听 tools/prompts/resources 的 list_changed 并刷新。消失的 tool 会从 pi active tools 移除，消失的 prompt 会变成明确的 unavailable 命令 |
+| **分页、缓存与变更通知** | ✅ 沿 cursor 拉取 tools/prompts/resources/templates 全部分页；通过 `subscriptions/listen` 订阅 list_changed。服务端给出 `ttlMs` 时可由客户端作为 freshness hint 使用。消失的 tool 会从 pi active tools 移除，消失的 prompt 会变成明确的 unavailable 命令 |
+| **协议边界** | ✅ 仅支持 2026-07-28 无状态 server；不发送 `initialize` 或 `notifications/initialized`，也不接受 `Mcp-Session-Id`、GET stream、旧版 `resources/subscribe` 语义 |
 | **生命周期管理** | ✅ `session_start` 时连接所有 server，`session_shutdown` 时关闭所有 transport；状态栏显示连接状态（connecting/N servers/N tools/N prompts） |
 | **取消与错误处理** | ✅ 工具/资源调用传递 AbortSignal 与超时；transport 错误抛给 pi，MCP tool 的 `isError=true` 保持为错误结果 |
 | **用户命令** | ✅ `/mcp-list`（列出所有 server/tool/prompt/resource）、`/mcp-reload`（重连所有 server） |
-| **E2E 测试** | ✅ 用 pi SDK 创建真实会话，加载扩展，挂载 `@modelcontextprotocol/server-filesystem`，验证工具注册 + `list_directory` 真实调用返回目录内容 |
+| **E2E 测试** | ✅ 用 pi SDK 创建真实会话，加载 2026-07-28 stdio fixture，验证能力发现、工具注册和 `tools/call` 返回内容 |
 
 ### 配置示例
 
 ```json
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+    "modern-stdio": {
+      "command": "node",
+      "args": ["/path/to/2026-07-28-mcp-server.mjs"]
     },
     "github": {
       "command": "npx",
@@ -72,7 +74,7 @@ cp packages/coding-agent/examples/extensions/mcp/mcp.example.json your-project/.
 
 ### 简历话术
 
-**"基于官方 MCP TypeScript SDK 为极简 coding agent harness 实现多 server 工具/资源/提示词热挂载，支持 stdio 与 Streamable HTTP 双 transport，自动响应 list_changed 通知刷新能力集，以 extension 形式零侵入核心接入，覆盖官方 filesystem/github 等 15+ 个 server 工具真实调用验证。"**
+**"基于官方 MCP TypeScript SDK transport 为极简 coding agent harness 实现 MCP 2026-07-28 无状态 client：每请求版本与能力 metadata、`server/discover`、Streamable HTTP 标准 headers、`subscriptions/listen` 动态能力刷新，以及 tools/resources/prompts 热挂载。"**
 
 ---
 
@@ -80,19 +82,19 @@ cp packages/coding-agent/examples/extensions/mcp/mcp.example.json your-project/.
 
 **目标**：让 agent 拥有跨会话的长期记忆，能主动记住用户偏好、项目约定、关键决策。
 
-**完成状态**：✅ 已完成 v0.1，约 300 行 glue code。核心记忆逻辑**不自己写**，spawn 官方 `@modelcontextprotocol/server-memory`（Anthropic 官方 Knowledge Graph Memory Server）作为后端。
+**完成状态**：✅ 已完成 v0.1，约 300 行 glue code。核心记忆逻辑**不自己写**，spawn MCP 2026-07-28 兼容的 Knowledge Graph Memory Server 作为后端。
 
 ### 设计原则（非常重要）
 
 **不要自己实现记忆存储/检索/去重/embedding**——这是社区里最容易踩的坑。直接接入成熟开源实现，只写 glue 层：
-- 存储格式、JSONL 持久化、节点搜索、图谱 CRUD：**全部交给官方 `@modelcontextprotocol/server-memory`**
+- 存储格式、JSONL 持久化、节点搜索、图谱 CRUD：**全部交给兼容的 Knowledge Graph MCP server**
 - 本 extension 只负责：spawn 子进程 + 转发 MCP 调用 + system prompt 自动注入 + LLM 友好的工具封装 + 用户命令
 
 ### 参考实现（实际使用的）
 
 | 层 | 实际选型 | 说明 |
 |---|---|---|
-| 知识图谱存储/检索后端 | [`@modelcontextprotocol/server-memory`](https://www.npmjs.com/package/@modelcontextprotocol/server-memory)（Anthropic 官方） | 通过 MCP stdio 子进程方式 spawn，entities/relations/observations 三元组模型，内置 `search_nodes`，JSONL 持久化，每次操作后立即写盘 |
+| 知识图谱存储/检索后端 | MCP 2026-07-28 兼容的 Knowledge Graph server | 通过 MCP stdio 子进程方式 spawn，entities/relations/observations 三元组模型，内置 `search_nodes`，JSONL 持久化，每次操作后立即写盘 |
 | 通信协议 | `@modelcontextprotocol/sdk` Client（和 MCP 扩展复用同一 SDK） | 不引入 mem0 等额外依赖，减少 runtime 复杂度；后续若需要语义向量检索，可再加 mem0-mcp server 通过 MCP 扩展挂载（零代码改动） |
 | System prompt 注入参考 | pi 自带 [system-prompt-header.ts](../../packages/coding-agent/examples/extensions/system-prompt-header.ts) | 通过 `before_agent_start` 事件返回 `{systemPrompt: ...}`，pi 负责链式拼接多个扩展的 prompt 段 |
 
@@ -100,7 +102,7 @@ cp packages/coding-agent/examples/extensions/mcp/mcp.example.json your-project/.
 
 | 能力 | 实现状态 |
 |---|---|
-| **后端进程管理** | ✅ `session_start` 时从已声明的 workspace 依赖解析并 spawn `@modelcontextprotocol/server-memory`，不在运行时联网下载；通过 `MEMORY_FILE_PATH` 指定持久化路径为 `<cwd>/.pi/memory.jsonl`，`session_shutdown` 时关闭 transport |
+| **后端进程管理** | ✅ `session_start` 时从已声明的 workspace 依赖解析并 spawn MCP 2026-07-28 兼容的 memory server，不在运行时联网下载；通过 `MEMORY_FILE_PATH` 指定持久化路径为 `<cwd>/.pi/memory.jsonl`，`session_shutdown` 时关闭 transport |
 | **记忆持久化** | ✅ 官方 server 负责 JSONL 存储（每行一个 entity/relation），每次写操作后立即 `fs.writeFile` 刷盘，实测 <500ms 落盘 |
 | **工具：memory__add_fact** | ✅ LLM 友好封装：自动判断 entity 是否存在，不存在先 `create_entities`，存在则 `add_observations`，LLM 无需关心底层 API 细节 |
 | **工具：memory__search** | ✅ 转发到官方 `search_nodes`（关键词匹配 entity 名称/类型/observations） |

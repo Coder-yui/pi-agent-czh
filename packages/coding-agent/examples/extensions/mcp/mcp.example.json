@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/your/project"]
+    "modern-stdio": {
+      "command": "node",
+      "args": ["/path/to/your-2026-07-28-mcp-server.mjs"]
     },
     "github": {
       "command": "npx",

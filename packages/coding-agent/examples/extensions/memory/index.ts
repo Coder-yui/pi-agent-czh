@@ -1,12 +1,13 @@
 /**
  * Memory extension for pi — long-term memory backed by the OFFICIAL
- * @modelcontextprotocol/server-memory Knowledge Graph MCP server.
+ * a 2026-07-28 Knowledge Graph MCP server.
  *
  * Design principle: this file is a thin glue layer. It does NOT implement
- * storage, retrieval, indexing, graph traversal, or persistence — the official
- * server (spawned as a child process via the MCP TypeScript SDK) handles all of
+ * storage, retrieval, indexing, graph traversal, or persistence — the declared
+ * server (spawned as a child process via the MCP transport) handles all of
  * that. We only:
- *   1. Resolve and spawn the declared `@modelcontextprotocol/server-memory` dependency on session_start
+ *   1. Resolve and spawn the declared `@modelcontextprotocol/server-memory` dependency on session_start.
+ *      The server must implement MCP 2026-07-28.
  *      (persisting to `<cwd>/.pi/memory.json` via MEMORY_FILE_PATH env var).
  *   2. Expose a small set of LLM-friendly memory__* tools that forward to the
  *      official server over MCP (add_fact, search, read_graph, create_relations,
@@ -20,18 +21,18 @@ import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { Type } from "typebox";
+import { StatelessMcpClient } from "../mcp/stateless-client.ts";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface ConnectedMemory {
-	client: Client;
-	transport: StdioClientTransport;
+	client: StatelessMcpClient;
+	transport: Transport;
 	memoryFile: string;
 }
 
@@ -131,13 +132,16 @@ function errorBlock(msg: string) {
 
 async function spawnMemoryServer(memoryFile: string): Promise<ConnectedMemory> {
 	mkdirSync(join(memoryFile, ".."), { recursive: true });
-	const transport = new StdioClientTransport({
-		command: process.execPath,
-		args: [memoryServerEntry],
-		env: { ...process.env, MEMORY_FILE_PATH: memoryFile },
-	});
-	const client = new Client({ name: "pi-memory-extension", version: "0.1.0" });
+	const createTransport = () =>
+		new StdioClientTransport({
+			command: process.execPath,
+			args: [memoryServerEntry],
+			env: { ...process.env, MEMORY_FILE_PATH: memoryFile },
+		});
+	const transport = createTransport();
+	const client = new StatelessMcpClient({ name: "pi-memory-extension", version: "0.2.0" });
 	await client.connect(transport);
+	await client.discover({ timeout: 15_000 });
 	return { client, transport, memoryFile };
 }
 
@@ -160,7 +164,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await shutdown(state);
-		// Official server-memory uses JSONL format (2026.x). Persist to <cwd>/.pi/memory.jsonl.
+		// The configured 2026-07-28 memory server owns the JSONL persistence format.
 		const memoryFile = join(ctx.cwd, ".pi", "memory.jsonl");
 		try {
 			state.mem = await spawnMemoryServer(memoryFile);
@@ -184,7 +188,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const result = await state.mem.client.callTool({
 				name: "search_nodes",
 				arguments: { query: query.slice(0, 1000) },
-			} as CallToolRequest["params"]);
+			});
 			const graph = parseGraph(extractText(result));
 			if (!graph) return;
 			const entities = graph.entities.slice(0, 12);
@@ -255,7 +259,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 				const res = await state.mem.client.callTool({
 					name: "add_observations",
 					arguments: { observations: [{ entityName: entity, contents: [fact] }] },
-				} as CallToolRequest["params"]);
+				});
 				const text = extractText(res);
 				if (/not found|unknown|does not exist|no entity/i.test(text)) {
 					// Entity doesn't exist yet; create it with this observation.
@@ -264,7 +268,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 						arguments: {
 							entities: [{ name: entity, entityType, observations: [fact] }],
 						},
-					} as CallToolRequest["params"]);
+					});
 					return textBlock(`Created new entity "${entity}" (${entityType}) and added fact: ${fact}`);
 				}
 				return textBlock(`Added fact to "${entity}": ${fact}`);
@@ -291,7 +295,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const res = await state.mem.client.callTool({
 				name: "search_nodes",
 				arguments: { query: String(args.query) },
-			} as CallToolRequest["params"]);
+			});
 			return textBlock(extractText(res) || "(no matches)");
 		},
 	});
@@ -307,7 +311,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const res = await state.mem.client.callTool({
 				name: "read_graph",
 				arguments: {},
-			} as CallToolRequest["params"]);
+			});
 			return textBlock(extractText(res) || "(empty graph)");
 		},
 	});
@@ -333,7 +337,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const res = await state.mem.client.callTool({
 				name: "create_relations",
 				arguments: { relations: args.relations },
-			} as CallToolRequest["params"]);
+			});
 			return textBlock(extractText(res) || `Created ${args.relations.length} relation(s).`);
 		},
 	});
@@ -351,7 +355,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			await state.mem.client.callTool({
 				name: "delete_entities",
 				arguments: { entityNames: [String(args.name)] },
-			} as CallToolRequest["params"]);
+			});
 			return textBlock(`Deleted entity "${args.name}" (if it existed).`);
 		},
 	});
@@ -368,7 +372,7 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const res = await state.mem.client.callTool({
 				name: "read_graph",
 				arguments: {},
-			} as CallToolRequest["params"]);
+			});
 			const text = extractText(res) || "(empty graph)";
 			ctx.ui.notify(`Long-term memory (${state.mem.memoryFile}):\n\n${text}`, "info");
 		},
@@ -392,14 +396,14 @@ export default async function memoryExtension(pi: ExtensionAPI) {
 			const res = await state.mem.client.callTool({
 				name: "read_graph",
 				arguments: {},
-			} as CallToolRequest["params"]);
+			});
 			const graph = parseGraph(extractText(res));
 			const names = graph?.entities.map((entity) => entity.name) ?? [];
 			if (names.length > 0) {
 				await state.mem.client.callTool({
 					name: "delete_entities",
 					arguments: { entityNames: names },
-				} as CallToolRequest["params"]);
+				});
 			}
 			ctx.ui.notify(`Cleared ${names.length} entities from memory.`, "info");
 		},

@@ -8,8 +8,8 @@
  *   prompts, and resources; registers them with pi.
  * - Tool calls are forwarded to MCP client.callTool() and results converted to
  *   pi's TextContent/ImageContent shape.
- * - Tools/prompts/resources automatically refresh on list_changed notifications
- *   (via SDK's listChanged handlers).
+ * - Tools/prompts/resources automatically refresh through 2026-07-28
+ *   subscriptions/listen notifications.
  * - MCP prompts are exposed as `/mcp-prompt-<server>-<name>` slash commands.
  * - MCP resources are readable via a synthetic tool `mcp__<server>__read_resource`
  *   that wraps client.readResource().
@@ -19,9 +19,9 @@
  * ```json
  * {
  *   "mcpServers": {
- *     "filesystem": {
- *       "command": "npx",
- *       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/project"]
+ *     "modern-stdio": {
+ *       "command": "node",
+ *       "args": ["/path/to/2026-07-28-mcp-server.mjs"]
  *     },
  *     "remote-example": {
  *       "url": "http://localhost:3000/mcp",
@@ -37,20 +37,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import {
-	type Prompt,
-	PromptListChangedNotificationSchema,
-	type Resource,
-	ResourceListChangedNotificationSchema,
-	type ResourceTemplate,
-	type Tool,
-	ToolListChangedNotificationSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import type { Prompt, Resource, ResourceTemplate, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { type TSchema, Type } from "typebox";
+import { MODERN_PROTOCOL_VERSION, StatelessMcpClient } from "./stateless-client.ts";
 
 // ============================================================================
 // Config loading
@@ -194,7 +186,7 @@ type ServerTransport = Transport & { close?: () => Promise<void> | void };
 
 interface ConnectedServer {
 	name: string;
-	client: Client;
+	client: StatelessMcpClient;
 	transport: ServerTransport;
 	tools: Tool[];
 	prompts: Prompt[];
@@ -208,45 +200,45 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function listAllTools(client: Client): Promise<Tool[]> {
+async function listAllTools(client: StatelessMcpClient): Promise<Tool[]> {
 	const tools: Tool[] = [];
 	let cursor: string | undefined;
 	do {
 		const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: 15_000 });
-		tools.push(...page.tools);
+		tools.push(...(page.tools as Tool[]));
 		cursor = page.nextCursor;
 	} while (cursor);
 	return tools;
 }
 
-async function listAllPrompts(client: Client): Promise<Prompt[]> {
+async function listAllPrompts(client: StatelessMcpClient): Promise<Prompt[]> {
 	const prompts: Prompt[] = [];
 	let cursor: string | undefined;
 	do {
 		const page = await client.listPrompts(cursor ? { cursor } : undefined, { timeout: 15_000 });
-		prompts.push(...page.prompts);
+		prompts.push(...(page.prompts as Prompt[]));
 		cursor = page.nextCursor;
 	} while (cursor);
 	return prompts;
 }
 
-async function listAllResources(client: Client): Promise<Resource[]> {
+async function listAllResources(client: StatelessMcpClient): Promise<Resource[]> {
 	const resources: Resource[] = [];
 	let cursor: string | undefined;
 	do {
 		const page = await client.listResources(cursor ? { cursor } : undefined, { timeout: 15_000 });
-		resources.push(...page.resources);
+		resources.push(...(page.resources as Resource[]));
 		cursor = page.nextCursor;
 	} while (cursor);
 	return resources;
 }
 
-async function listAllResourceTemplates(client: Client): Promise<ResourceTemplate[]> {
+async function listAllResourceTemplates(client: StatelessMcpClient): Promise<ResourceTemplate[]> {
 	const templates: ResourceTemplate[] = [];
 	let cursor: string | undefined;
 	do {
 		const page = await client.listResourceTemplates(cursor ? { cursor } : undefined, { timeout: 15_000 });
-		templates.push(...page.resourceTemplates);
+		templates.push(...(page.resourceTemplates as ResourceTemplate[]));
 		cursor = page.nextCursor;
 	} while (cursor);
 	return templates;
@@ -292,10 +284,45 @@ async function connectStdioServer(
 async function connectHttpServer(
 	cfg: HttpServerConfig,
 ): Promise<{ transport: ServerTransport; close: () => Promise<void> }> {
+	const encodeHeaderValue = (value: string): string => {
+		const isSafe = /^[\t\x20-\x7e]+$/.test(value) && value.trim() === value;
+		return isSafe && !(value.startsWith("=?base64?") && value.endsWith("?="))
+			? value
+			: `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
+	};
+	const fetchWithMcpHeaders = async (input: string | URL, init?: RequestInit): Promise<Response> => {
+		if (typeof init?.body !== "string") return fetch(input, init);
+		const headers = new Headers(init.headers);
+		headers.set("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION);
+		try {
+			const message: unknown = JSON.parse(init.body);
+			if (
+				typeof message === "object" &&
+				message !== null &&
+				"method" in message &&
+				typeof message.method === "string"
+			) {
+				headers.set("Mcp-Method", message.method);
+				if (
+					"params" in message &&
+					typeof message.params === "object" &&
+					message.params !== null &&
+					("name" in message.params || "uri" in message.params)
+				) {
+					const value = "name" in message.params ? message.params.name : message.params.uri;
+					if (typeof value === "string") headers.set("Mcp-Name", encodeHeaderValue(value));
+				}
+			}
+		} catch {
+			// The SDK only sends JSON-RPC bodies; leave validation to the server if parsing fails.
+		}
+		return fetch(input, { ...init, headers });
+	};
 	const transport = new StreamableHTTPClientTransport(new URL(cfg.url), {
 		requestInit: cfg.headers ? { headers: cfg.headers } : undefined,
+		fetch: fetchWithMcpHeaders,
 	});
-	// StreamableHTTPClientTransport provides onclose/onerror but no explicit close()? It does:
+	transport.setProtocolVersion?.(MODERN_PROTOCOL_VERSION);
 	return { transport, close: () => transport.close() };
 }
 
@@ -326,7 +353,7 @@ function registerServerTools(pi: ExtensionAPI, server: ConnectedServer) {
 							arguments: params as Record<string, unknown>,
 						},
 						undefined,
-						{ signal, timeout: 60_000, maxTotalTimeout: 120_000, resetTimeoutOnProgress: true },
+						{ signal, timeout: 60_000 },
 					);
 
 					const blocks = (result.content as McpContentBlock[] | undefined) ?? [];
@@ -386,11 +413,9 @@ function registerResourceAccessTool(pi: ExtensionAPI, server: ConnectedServer) {
 		}),
 		async execute(_callId, params, signal) {
 			try {
-				const result = await server.client.readResource(
-					{ uri: String(params.uri) },
-					{ signal, timeout: 30_000, maxTotalTimeout: 60_000 },
-				);
-				const blocks: McpContentBlock[] = result.contents.map((c) => {
+				const result = await server.client.readResource({ uri: String(params.uri) }, { signal, timeout: 30_000 });
+				const contents = result.contents as Array<{ uri: string; text?: string; blob?: string; mimeType?: string }>;
+				const blocks: McpContentBlock[] = contents.map((c) => {
 					if ("text" in c) {
 						return { type: "resource", resource: { uri: c.uri, text: c.text, mimeType: c.mimeType } };
 					}
@@ -441,12 +466,16 @@ function registerPromptCommands(pi: ExtensionAPI, server: ConnectedServer) {
 
 					const result = await server.client.getPrompt({ name: prompt.name, arguments: promptArgs });
 					const lines: string[] = [`[mcp-prompt:${server.name}/${prompt.name}]`];
-					for (const msg of result.messages ?? []) {
+					const messages = (result.messages ?? []) as Array<{
+						role: string;
+						content: { type: string; text?: string; resource?: { uri: string } };
+					}>;
+					for (const msg of messages) {
 						const role = msg.role;
 						const content = msg.content;
 						if (content.type === "text") {
 							lines.push(`<${role}>\n${content.text}`);
-						} else if (content.type === "resource") {
+						} else if (content.type === "resource" && content.resource) {
 							lines.push(`<${role}> [resource ${content.resource.uri}]`);
 						} else {
 							lines.push(`<${role}> [${content.type}]`);
@@ -475,70 +504,45 @@ function registerPromptCommands(pi: ExtensionAPI, server: ConnectedServer) {
 
 async function connectServer(name: string, cfg: ServerConfig): Promise<ConnectedServer> {
 	const { transport } = isHttpConfig(cfg) ? await connectHttpServer(cfg) : await connectStdioServer(name, cfg);
-
-	const client = new Client(
-		{ name: "pi-mcp-extension", version: "0.0.1" },
-		{
-			capabilities: {},
-		},
-	);
-
+	const client = new StatelessMcpClient({ name: "pi-mcp-extension", version: "0.1.0" });
 	await client.connect(transport);
-
-	let tools: Tool[] = [];
-	let prompts: Prompt[] = [];
-	let resources: Resource[] = [];
-	let resourceTemplates: ResourceTemplate[] = [];
-
-	const caps = client.getServerCapabilities() ?? {};
-
-	if (caps.tools) {
-		tools = await listAllTools(client);
-	}
+	const caps = (await client.discover({ timeout: 15_000 })).capabilities;
+	const server: ConnectedServer = {
+		name,
+		client,
+		transport,
+		tools: [],
+		prompts: [],
+		resources: [],
+		resourceTemplates: [],
+		registeredToolNames: new Set(),
+		registeredCommandNames: new Set(),
+	};
+	if (caps.tools) server.tools = await listAllTools(client);
 	if (caps.prompts) {
 		try {
-			prompts = await listAllPrompts(client);
+			server.prompts = await listAllPrompts(client);
 		} catch {
 			/* prompts not supported */
 		}
 	}
 	if (caps.resources) {
 		try {
-			resources = await listAllResources(client);
-			try {
-				resourceTemplates = await listAllResourceTemplates(client);
-			} catch {
-				resourceTemplates = [];
-			}
+			server.resources = await listAllResources(client);
+			server.resourceTemplates = await listAllResourceTemplates(client);
 		} catch {
 			/* resources not supported */
 		}
 	}
-
-	return {
-		name,
-		client,
-		transport,
-		tools,
-		prompts,
-		resources,
-		resourceTemplates,
-		registeredToolNames: new Set(),
-		registeredCommandNames: new Set(),
-	};
+	return server;
 }
 
-function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer) {
-	const caps = server.client.getServerCapabilities() ?? {};
-	// Re-create the client with listChanged handlers? The SDK Client reads
-	// `listChanged` from constructor options at connect() time, so we cannot
-	// retrofit it after connect. Instead, fall back to registering raw
-	// notification handlers via the transport-level onmessage.
-	//
-	// Simpler & robust: set up a periodic "reload on notification" handler by
-	// hooking into client.setNotificationHandler if available.
-	//
-	// The SDK Client exposes `setNotificationHandler` via Protocol base class.
+async function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer): Promise<void> {
+	const caps = (server.client.getServerCapabilities() ?? {}) as {
+		tools?: { listChanged?: boolean };
+		prompts?: { listChanged?: boolean };
+		resources?: { listChanged?: boolean };
+	};
 	const refreshTools = async () => {
 		try {
 			server.tools = await listAllTools(server.client);
@@ -572,25 +576,16 @@ function wireListChangedHandlers(pi: ExtensionAPI, server: ConnectedServer) {
 		}
 	};
 
-	try {
-		if (caps.tools?.listChanged) {
-			server.client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-				await refreshTools();
-			});
-		}
-		if (caps.prompts?.listChanged) {
-			server.client.setNotificationHandler(PromptListChangedNotificationSchema, async () => {
-				await refreshPrompts();
-			});
-		}
-		if (caps.resources?.listChanged) {
-			server.client.setNotificationHandler(ResourceListChangedNotificationSchema, async () => {
-				await refreshResources();
-			});
-		}
-	} catch {
-		/* If the SDK shape differs, list_changed just won't auto-refresh. */
-	}
+	if (caps.tools?.listChanged) server.client.onNotification("notifications/tools/list_changed", refreshTools);
+	if (caps.prompts?.listChanged) server.client.onNotification("notifications/prompts/list_changed", refreshPrompts);
+	if (caps.resources?.listChanged)
+		server.client.onNotification("notifications/resources/list_changed", refreshResources);
+	if (!caps.tools?.listChanged && !caps.prompts?.listChanged && !caps.resources?.listChanged) return;
+	await server.client.subscribe({
+		toolsListChanged: !!caps.tools?.listChanged,
+		promptsListChanged: !!caps.prompts?.listChanged,
+		resourcesListChanged: !!caps.resources?.listChanged,
+	});
 }
 
 function registerServerAll(pi: ExtensionAPI, server: ConnectedServer) {
@@ -649,7 +644,7 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 				ctx.ui.setStatus("mcp", `MCP: connecting ${name}...`);
 				const server = await connectServer(name, cfg);
 				registerServerAll(pi, server);
-				wireListChangedHandlers(pi, server);
+				await wireListChangedHandlers(pi, server);
 				servers.push(server);
 				connected += 1;
 				totalTools += server.tools.length;
@@ -737,7 +732,7 @@ export default async function mcpExtension(pi: ExtensionAPI) {
 				try {
 					const server = await connectServer(name, cfg);
 					registerServerAll(pi, server);
-					wireListChangedHandlers(pi, server);
+					await wireListChangedHandlers(pi, server);
 					servers.push(server);
 					connected += 1;
 					totalTools += server.tools.length;

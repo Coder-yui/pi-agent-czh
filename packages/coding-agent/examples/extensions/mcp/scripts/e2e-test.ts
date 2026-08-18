@@ -3,14 +3,13 @@
  *
  * - Creates a pi AgentSession with the MCP extension loaded as an inline factory
  * - Triggers session_start (bindExtensions) so the MCP server connects
- * - Verifies that mcp__filesystem__* tools are registered
+ * - Verifies that a 2026-07-28 MCP tool is registered
  * - Invokes one MCP tool via the session tool registry and checks the result
  *
  * Does NOT call the LLM — we only exercise the extension + tool wiring.
  */
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +17,6 @@ import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 
 // Locate coding-agent package root from this script's location.
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
 const CODING_AGENT_ROOT = join(__dirname, "../../../../");
 const CORE_DIR = join(CODING_AGENT_ROOT, "src", "core");
 
@@ -27,11 +25,8 @@ const { createAgentSession } = await import(join(CORE_DIR, "sdk.ts"));
 const { SessionManager } = await import(join(CORE_DIR, "session-manager.ts"));
 const { SettingsManager } = await import(join(CORE_DIR, "settings-manager.ts"));
 const mcpExtension = (await import(join(__dirname, "..", "index.ts"))).default;
-const filesystemServer = join(
-	dirname(require.resolve("@modelcontextprotocol/server-filesystem/package.json")),
-	"dist",
-	"index.js",
-);
+const modernServer = join(__dirname, "modern-test-server.ts");
+const tsxCli = join(CODING_AGENT_ROOT, "..", "..", "node_modules", "tsx", "dist", "cli.mjs");
 
 async function main() {
 	const tempDir = join(tmpdir(), `pi-mcp-e2e-${Date.now()}`);
@@ -40,15 +35,15 @@ async function main() {
 	mkdirSync(join(cwd, ".pi"), { recursive: true });
 	mkdirSync(agentDir, { recursive: true });
 
-	// Project-local MCP config — mount filesystem server scoped to cwd.
+	// Project-local MCP config — mount a strict 2026-07-28 stdio server.
 	writeFileSync(
 		join(cwd, ".pi", "mcp.json"),
 		JSON.stringify(
 			{
 				mcpServers: {
-					filesystem: {
+					fixture: {
 						command: process.execPath,
-						args: [filesystemServer, cwd],
+						args: [tsxCli, modernServer],
 					},
 				},
 			},
@@ -56,7 +51,6 @@ async function main() {
 			2,
 		),
 	);
-	writeFileSync(join(cwd, "hello.txt"), "hello from pi-mcp-test\n");
 
 	// Use faux provider so the test doesn't need any API key (we won't call LLM anyway).
 	const faux = registerFauxProvider();
@@ -107,12 +101,11 @@ async function main() {
 		throw new Error("No MCP tools were registered — extension may have failed to connect.");
 	}
 
-	// Pick the list_directory tool and actually invoke it.
-	const listDir = mcpTools.find((t: { name: string }) => t.name === "mcp__filesystem__list_directory");
-	if (!listDir) throw new Error("mcp__filesystem__list_directory not found");
+	const fixtureTool = mcpTools.find((t: { name: string }) => t.name === "mcp__fixture__read_fixture");
+	if (!fixtureTool) throw new Error("mcp__fixture__read_fixture not found");
 
-	console.log(`[test] invoking ${listDir.name} with path=${cwd}`);
-	const result = await listDir.execute("test-call", { path: cwd });
+	console.log(`[test] invoking ${fixtureTool.name}`);
+	const result = await fixtureTool.execute("test-call", {});
 	console.log(`[test] tool result content:`);
 	for (const block of result.content) {
 		if (block.type === "text") {
@@ -126,8 +119,8 @@ async function main() {
 		.filter((b: { type: string; text?: string }): b is { type: "text"; text: string } => b.type === "text")
 		.map((b: { text: string }) => b.text)
 		.join("\n");
-	if (!textContent.includes("hello.txt")) {
-		throw new Error(`Expected hello.txt in list_directory output, got:\n${textContent}`);
+	if (!textContent.includes("modern MCP fixture response")) {
+		throw new Error(`Unexpected modern MCP tool output:\n${textContent}`);
 	}
 	if ((result.details as any)?.isError) {
 		throw new Error(`Tool reported MCP isError: ${JSON.stringify(result.details)}`);

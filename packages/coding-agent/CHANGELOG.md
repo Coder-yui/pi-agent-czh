@@ -5,6 +5,7 @@
 ### Added
 
 - Added `pi auth check` provider/model auth preflight with optional credential output ([#7152](https://github.com/earendil-works/pi/issues/7152)).
+- Added MCP 2026-07-28 stateless client support for extension and memory-server connections, including discovery, per-request metadata, required HTTP request headers, and `subscriptions/listen` capability refreshes.
 
 ### Changed
 

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "main": "index.ts",
-  "description": "Long-term memory for pi via the official @modelcontextprotocol/server-memory Knowledge Graph server",
+	"description": "Long-term memory for pi via a MCP 2026-07-28 Knowledge Graph server",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.0",
     "@modelcontextprotocol/sdk": "1.30.0",
